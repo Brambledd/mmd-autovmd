@@ -769,6 +769,138 @@ function goodbyeWave(p: Record<string, number>): string {
   return `${poses}@animation bye_anim {\n${frames.join("\n")}\n}\n`
 }
 
+/**
+ * 灵动深蹲（姿势照搬 examples/squat-lively.mpl）：预备后仰 → 髋铰链下蹲 → 触底弹跳 → 站起过冲回落。
+ * depth 深度倍率（0.5 半蹲 ~ 1.1 全蹲）；cycles 次数（偶数拍双弹跳，最后一拍底部保持 hold 并眨眼）；
+ * tempo 节奏倍率（越大越快）；hold 最后一拍底部保持秒数；arm_swing 摆臂幅度（< 0.5 手臂自然垂放、不前伸）。
+ * 所有角度 5° 量化；踝角 = 膝角 − 髋角，脚掌保持水平；末帧回到 sq_top 接续姿势；时长 = 最大时间戳。
+ * 每个下蹲姿势都带 plant feet（关键帧贴地；帧间由 final 管线的贴地烘焙补齐）。
+ */
+function squat(p: Record<string, number>): string {
+  const d = p.depth ?? 1
+  const cycles = Math.max(1, Math.round(p.cycles ?? 3))
+  const tempo = p.tempo ?? 1
+  const hold = p.hold ?? 0.6
+  const a = p.arm_swing ?? 1
+  const face = p.face ?? 0.6
+  const reach = a >= 0.5
+  const deg = (base: number) => q5(base * d)
+  const f = (v: number) => f2(Math.min(1, Math.max(0, v * face)))
+  const extra = (dir: "left" | "right", v: number) => (v > 0 ? `, sway ${dir} ${v}` : "")
+
+  const legsStand =
+    "    leg_l sway left 5;\n    leg_r sway right 5;\n    knee_l reset;\n    knee_r reset;\n    ankle_l reset;\n    ankle_r reset;\n"
+  const legsBent = (hip: number, knee: number, out: number) =>
+    `    leg_l bend forward ${hip}${extra("left", out)};\n` +
+    `    leg_r bend forward ${hip}${extra("right", out)};\n` +
+    `    knee_l bend backward ${knee};\n    knee_r bend backward ${knee};\n` +
+    `    ankle_l bend backward ${knee - hip};\n    ankle_r bend backward ${knee - hip};\n`
+  const armsHang =
+    "    arm_l bend forward 10;\n    arm_r bend forward 10;\n    elbow_l bend forward 5;\n    elbow_r bend forward 5;\n"
+  const armsSwing = (fwd: number, out: number, elbow: number, dir: "out" | "in") =>
+    reach
+      ? `    arm_l bend forward ${q5(fwd * a)}${extra(dir === "out" ? "left" : "right", q5(out * a))};\n` +
+        `    arm_r bend forward ${q5(fwd * a)}${extra(dir === "out" ? "right" : "left", q5(out * a))};\n` +
+        `    elbow_l bend forward ${q5(elbow * a)};\n    elbow_r bend forward ${q5(elbow * a)};\n`
+      : armsHang
+  const squatArms = reach
+    ? "    reach hand_l to front_l;\n    reach hand_r to front_r;\n"
+    : armsHang
+  const hands = "    hand_l relax;\n    hand_r relax;\n    aim head at camera;\n"
+  const faceLines = (nikori: number, warai: number, wink = 0) =>
+    `    face にこり ${f(nikori)};\n    face 笑い ${f(warai)};\n    face ウィンク ${wink};\n`
+
+  const hipH = deg(30)
+  const kneeH = deg(50)
+  const hipC = deg(76)
+  const kneeC = deg(104)
+  const hipB = deg(90)
+  const kneeB = deg(120)
+
+  const bentBody = (
+    down: number,
+    back: number,
+    waist: number,
+    upper: number,
+    upper2: number,
+    swayL: number,
+    swayR: number
+  ) =>
+    `    center move down ${f2(down * d)};\n    center move backward ${f2(back * d)};\n    plant feet;\n` +
+    `    waist bend forward ${deg(waist)};\n    upper_body bend forward ${deg(upper)};\n` +
+    `    upper_body2 bend backward ${deg(upper2)}${extra("left", deg(swayL))};\n` +
+    `    neck reset;\n    head sway right ${deg(swayR)};\n`
+
+  const poses = `@pose sq_top {
+    center reset;
+    upper_body reset;
+    upper_body2 reset;
+    neck reset;
+    head reset;
+    waist reset;
+${legsStand}${armsSwing(38, 0, 12, "out")}    wrist_l reset;
+    wrist_r reset;
+${hands}${faceLines(0.6, 0)}}
+
+@pose sq_antic {
+    center reset;
+    upper_body bend backward 5;
+    upper_body2 bend backward 5;
+    neck bend backward 5;
+    head bend backward 5;
+    waist reset;
+${legsStand}${armsSwing(24, 22, 14, "out")}    wrist_l reset;
+    wrist_r reset;
+${hands}${faceLines(0.8, 0)}}
+
+@pose sq_hinge {
+${bentBody(1, 0.8, 15, 5, 5, 0, 3)}${legsBent(hipH, kneeH, 5)}${squatArms}${hands}${faceLines(0.6, 0)}}
+
+@pose sq_bottom {
+${bentBody(4, 2.7, 25, 10, 8, 3, 6)}${legsBent(hipB, kneeB, deg(17))}${squatArms}${hands}${faceLines(0.5, 0.4)}}
+
+@pose sq_bottom_wink {
+${bentBody(4, 2.7, 25, 10, 8, 3, 10)}${legsBent(hipB, kneeB, deg(17))}${squatArms}${hands}${faceLines(0.7, 0.6, 1)}}
+
+@pose sq_bounce {
+${bentBody(3.3, 2.2, 21, 8, 7, 2, 5)}${legsBent(hipC, kneeC, deg(14))}${squatArms}${hands}${faceLines(0.6, 0.4)}}
+
+@pose sq_over {
+    center reset;
+    upper_body bend backward 5;
+    upper_body2 bend backward 5;
+    neck bend backward 5;
+    head bend backward 5, sway left 5;
+    waist reset;
+${legsStand}${armsSwing(16, 24, 10, "in")}    wrist_l reset;
+    wrist_r reset;
+${hands}${faceLines(0.8, 0.5)}}
+`
+  const dt = (x: number) => f2(x / tempo)
+  let t = 0
+  const frames = [`    0: sq_top;`]
+  const at = (delta: number, pose: string) => {
+    t = f2(t + dt(delta))
+    frames.push(`    ${t}: ${pose};`)
+  }
+  for (let k = 1; k <= cycles; k++) {
+    const last = k === cycles
+    at(k === 1 ? 0.5 : 0.3, "sq_antic")
+    at(0.2, "sq_hinge")
+    at(0.5, "sq_bottom")
+    const bounces = k % 2 === 0 ? 2 : 1
+    for (let b = 0; b < bounces; b++) {
+      at(0.15, "sq_bounce")
+      const toWink = last && b === bounces - 1 && hold > 0
+      at(toWink ? hold : 0.25, toWink ? "sq_bottom_wink" : "sq_bottom")
+    }
+    at(0.75, "sq_top")
+    at(0.2, "sq_over")
+    at(0.35, "sq_top")
+  }
+  return `${poses}@animation squat_anim {\n${frames.join("\n")}\n}\n`
+}
+
 export const LEXICON: MotionPrimitive[] = [
   { name: "wave_hand", tags: ["greeting", "loopable", "arm"], description: "Raise right hand and wave (smiles if face > 0)", params: { cycles: { min: 1, max: 6, default: 2 }, amplitude: { min: 0.5, max: 1.5, default: 1 }, face: { min: 0, max: 0.85, default: 0.8 } }, build: waveHand },
   { name: "nod_yes", tags: ["gesture", "loopable", "head"], description: "Nod head up and down", params: { cycles: { min: 1, max: 5, default: 2 }, amplitude: { min: 0.5, max: 1.5, default: 1 } }, build: nodYes },
@@ -793,6 +925,7 @@ export const LEXICON: MotionPrimitive[] = [
   { name: "step_closer", tags: ["acting", "walk", "fullbody"], description: "Walk a few graceful steps forward closer to the camera and stop", params: { steps: { min: 1, max: 3, default: 2 } }, build: stepCloser },
   { name: "weight_shift", tags: ["acting", "idle", "loopable"], description: "Gentle weight shift side to side listening attentively", params: { cycles: { min: 1, max: 4, default: 1 }, hold: { min: 0.4, max: 3, default: 0.8 } }, build: weightShift },
   { name: "goodbye_wave", tags: ["acting", "greeting", "loopable", "arm"], description: "Warm farewell wave smiling gently at the camera", params: { cycles: { min: 1, max: 4, default: 2 } }, build: goodbyeWave },
+  { name: "squat", tags: ["exercise", "fullbody", "loopable"], description: "Lively squat reps with feet planted: anticipation, hip hinge, bottom bounce, overshoot settle (depth 0.5 half ~ 1.1 full; even reps double-bounce; last rep holds and winks)", params: { depth: { min: 0.5, max: 1.1, default: 1 }, cycles: { min: 1, max: 6, default: 3 }, tempo: { min: 0.6, max: 1.6, default: 1 }, hold: { min: 0, max: 2, default: 0.6 }, arm_swing: { min: 0, max: 1.2, default: 1 }, face: { min: 0, max: 1, default: 0.6 } }, build: squat },
 ]
 
 export const LEXICON_MAP: Record<string, MotionPrimitive> = Object.fromEntries(LEXICON.map((m) => [m.name, m]))

@@ -89,6 +89,35 @@ test("镜像分段可编译且左右翻转", () => {
 test("未知动作返回 null", () => {
   assert.equal(expandLexiconSegment("moonwalk"), null)
 })
+test("词库 squat：参数越界被钳制，角度 5° 量化且踝角 = 膝角 − 髋角（脚掌水平）", () => {
+  const seg = expandLexiconSegment("squat", { depth: 99, cycles: 99, tempo: 99 })
+  assert.match(seg.fragment, /leg_l bend forward 100, sway left 20;/) // depth 钳到 1.1：q5(90×1.1)=100, q5(17×1.1)=20
+  assert.match(seg.fragment, /knee_l bend backward 130;/) //            q5(120×1.1)=130
+  assert.match(seg.fragment, /ankle_l bend backward 30;/) //             130 − 100 → 脚掌保持水平
+  assert.match(seg.fragment, /plant feet;/) //                              每个下蹲姿势都带 plant feet
+  const anim = seg.fragment.slice(seg.fragment.indexOf("@animation"))
+  assert.equal((anim.match(/sq_antic;/g) || []).length, 6, "cycles must clamp to 6 reps")
+  const first = [...anim.matchAll(/^\s*([\d.]+)\s*:/gm)].map((m) => Number(m[1])).slice(0, 2)
+  assert.equal(first[1], 0.31, "tempo must clamp to 1.6 (0.5s anticipation → 0.31s)")
+})
+test("词库 squat：第一拍与 examples/squat-lively.mpl 逐帧一致，末帧回到接续姿势，时长 = 最大时间戳", () => {
+  const seg = expandLexiconSegment("squat", {})
+  const anim = seg.fragment.slice(seg.fragment.indexOf("@animation"))
+  const frames = [...anim.matchAll(/^\s*([\d.]+)\s*:\s*(\w+);/gm)].map((m) => `${m[1]}: ${m[2]};`)
+  assert.deepEqual(frames.slice(0, 9), [
+    "0: sq_top;", "0.5: sq_antic;", "0.7: sq_hinge;", "1.2: sq_bottom;", "1.35: sq_bounce;",
+    "1.6: sq_bottom;", "2.35: sq_top;", "2.55: sq_over;", "2.9: sq_top;",
+  ])
+  assert.equal(frames.at(-1), "9.05: sq_top;", "last frame must be the exit pose")
+  assert.equal(frames[0], "0: sq_top;")
+  assert.equal(seg.duration, 9.05)
+  assert.equal(fragmentDuration(seg.fragment), seg.duration)
+  // 3 拍：最后一拍底部保持并眨眼；摆臂关闭时不出现 reach
+  assert.match(anim, /sq_bottom_wink;/)
+  assert.equal((anim.match(/sq_bottom_wink;/g) || []).length, 1)
+  assert.doesNotMatch(expandLexiconSegment("squat", { arm_swing: 0 }).fragment, /reach hand/)
+  assert.match(seg.fragment, /reach hand_l to front_l;/)
+})
 
 // ---------------------------------------------------------------- 3. Plan 归一化
 console.log("[3] plan 归一化")
