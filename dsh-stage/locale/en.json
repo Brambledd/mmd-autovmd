@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "PoPo Stage",
+    "description": "Shows the PoPo 3D character stage (http://localhost:4000) in the right sidebar, scaled down so the character stays in frame."
+  }
+}

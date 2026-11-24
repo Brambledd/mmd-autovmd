@@ -1,0 +1,8 @@
+# PoPo stage layer for a DSH profile.
+#
+# One row: the plugin registers the `popo-stage` right-Sidebar tab type, a
+# "PoPo 舞台" trigger beside Settings at the sidebar foot, and a General-settings
+# switch for auto-open. The stage itself is served by PoPo (http://localhost:4000).
+- insert:
+    - id: popo-stage
+      name: '@popo/dsh-stage'
