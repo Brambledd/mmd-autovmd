@@ -19,7 +19,7 @@ import { critiquePoseVmd } from "../src/lib/pose-critic.ts"
 import { POSE_EXEMPLARS } from "../src/lib/pose-exemplars.ts"
 import { renderPoseMultiViewPng } from "../src/lib/pose-renderer.ts"
 import { auditVmd } from "../src/lib/pose-audit.ts"
-import { enhanceVmd } from "../src/lib/vmd-enhancer.ts"
+import { finalizeMotion } from "../src/lib/motion-finalize.ts"
 import { LEXICON } from "../src/lib/motion-lexicon.ts"
 import { parseMorphFrames } from "../src/lib/vmd-morph.ts"
 
@@ -72,9 +72,9 @@ const allCases = [
 
 for (const tc of allCases) {
   const res = compileMPL2(compiler, tc.mpl, topaz)
-  const critic = critiquePoseVmd(topaz, res.vmd, tc.mpl)
+  const critic = critiquePoseVmd(topaz, res.vmd, tc.mpl, undefined, { sampling: "keyframes" })
   const audit = auditVmd(res.vmd, topaz)
-  const enh = enhanceVmd(audit.vmd, { autoBlink: true })
+  const enh = finalizeMotion(audit.vmd, topaz, { mplSource: tc.mpl, enhanceOptions: { autoBlink: true } }).vmd
   const criticAfter = critiquePoseVmd(topaz, enh, tc.mpl)
   const rendered = tc.name.startsWith("golden:") ? renderPoseMultiViewPng(topaz, res.vmd) : true
   const morphs = parseMorphFrames(enh)
@@ -87,7 +87,7 @@ for (const tc of allCases) {
     Boolean(rendered)
   if (ok) okCount++
   console.log(
-    `${ok ? "PASS" : "FAIL"}  ${tc.name.padEnd(32)} | ik=${String(res.ikOps).padStart(2)} hand=${res.handPresets} morph=${String(morphs.length).padStart(2)} auditViol=${audit.violations.length} | ${critic?.summary}`
+    `${ok ? "PASS" : "FAIL"}  ${tc.name.padEnd(32)} | ik=${String(res.ikOps).padStart(2)} hand=${res.handPresets} morph=${String(morphs.length).padStart(2)} auditViol=${audit.violations.length} | ${criticAfter?.summary}`
   )
 }
 console.log(`\nOffline Score: ${okCount}/${allCases.length} passed (${((okCount / allCases.length) * 100).toFixed(1)}%)`)
@@ -121,8 +121,8 @@ if (process.argv.includes("--live")) {
       continue
     }
     const res = compileMPL2(compiler, j.mpl, topaz)
-    const critic = critiquePoseVmd(topaz, res.vmd, j.mpl, j.timeline)
-    const enh = enhanceVmd(res.vmd, { autoBlink: true })
+    const critic = critiquePoseVmd(topaz, res.vmd, j.mpl, j.timeline, { sampling: "keyframes" })
+    const enh = finalizeMotion(auditVmd(res.vmd, topaz).vmd, topaz, { mplSource: j.mpl, enhanceOptions: { autoBlink: true } }).vmd
     const criticAfter = critiquePoseVmd(topaz, enh, j.mpl, j.timeline)
     const rag = (j.plan?.segments ?? []).flatMap((s) => s.exemplars ?? []).join(",") || "-"
     const vc = j.visualCritic

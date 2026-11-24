@@ -801,7 +801,6 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
       const tileSummary = tileCoords
         .map((c) => `t=${c.timeSec}s(footLiftL=${c.footLiftL}u,R=${c.footLiftR}u,hipDrop=${c.hipDrop}u,hipBack=${c.hipBackShift}u)`)
         .join("; ")
-      const ground = groundReport(fin)
       return {
         content: [
           { type: "image", data: base64, mimeType: "image/png" },
