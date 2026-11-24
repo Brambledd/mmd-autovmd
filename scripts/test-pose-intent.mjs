@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { parsePmxBones } from "../src/lib/pmx-bones.ts"
 import { compileMPL2 } from "../src/lib/mpl2.ts"
 import { critiquePoseVmd } from "../src/lib/pose-critic.ts"
+import { finalizeMotion } from "../src/lib/motion-finalize.ts"
 import { stitchSegments } from "../src/lib/long-motion.ts"
 import { getServerCompiler } from "../src/lib/server-compile.ts"
 import { compilePoseIntentToMPL2, parsePoseIntentJSON } from "../src/lib/pose-intent.ts"
@@ -70,7 +71,10 @@ test("compilePoseIntentToMPL2 crouch+shoe passes compileMPL2 + critiquePoseVmd",
   const res = compileMPL2(compiler, stitched.script, bones)
   assert(res.vmd.length > 0, "VMD must be non-empty")
   assert.equal(res.directiveErrors.length, 0)
-  const report = critiquePoseVmd(bones, res.vmd, stitched.script, stitched.timeline)
+  // 判定对象 = 舞台实际播放的成品（增强 + 贴地烘焙）：起蹲过渡段关键帧之间的下沉由烘焙修掉
+  const fin = finalizeMotion(res.vmd, bones, { mplSource: stitched.script, enhanceOptions: { autoBlink: true } })
+  assert.equal(fin.baked, true, "crouch transition sinks between keys; the ground bake must engage")
+  const report = critiquePoseVmd(bones, fin.vmd, stitched.script, stitched.timeline)
   assert(report && report.passed, `critiquePoseVmd failed: ${report?.summary}`)
 })
 
@@ -88,7 +92,8 @@ test("compilePoseIntentToMPL2 sit + wave passes compileMPL2 + critiquePoseVmd", 
   const res = compileMPL2(compiler, stitched.script, bones)
   assert(res.vmd.length > 0)
   assert.equal(res.directiveErrors.length, 0)
-  const report = critiquePoseVmd(bones, res.vmd, stitched.script, stitched.timeline)
+  const fin = finalizeMotion(res.vmd, bones, { mplSource: stitched.script, enhanceOptions: { autoBlink: true } })
+  const report = critiquePoseVmd(bones, fin.vmd, stitched.script, stitched.timeline)
   assert(report && report.passed, `critiquePoseVmd failed: ${report?.summary}`)
 })
 

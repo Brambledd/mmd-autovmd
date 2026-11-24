@@ -6,9 +6,10 @@ import { Card, CardDescription, CardHeader } from "./ui/card"
 import { useState, useEffect, useCallback, useRef } from "react"
 import { Textarea } from "./ui/textarea"
 import { useMPLCompiler } from "@/hooks/useMPLCompiler"
-import { computeIkSchedule, enhanceVmd } from "@/lib/vmd-enhancer"
+import { computeIkSchedule } from "@/lib/vmd-enhancer"
 import type { IkWindow } from "@/lib/vmd-enhancer"
 import { compileMPL2 } from "@/lib/mpl2"
+import { describeGroundContact, finalizeMotion } from "@/lib/motion-finalize"
 import { serializePmxBones } from "@/lib/pmx-bones"
 import { auditVmd, formatAuditReport } from "@/lib/pose-audit"
 import { buildModelConditioning } from "@/lib/model-conditioning"
@@ -147,7 +148,10 @@ export default function ChatInput({
         }
         audited = audit.vmd
       }
-      const vmdBytes = enhanceVmd(audited, { autoBlink: true })
+      // 成片 = 增强 + 贴地烘焙（与 MCP export_motion final 同一条管线）：舞台播的就是检查过的
+      const fin = finalizeMotion(audited, bones, { mplSource: mplScript, enhanceOptions: { autoBlink: true } })
+      if (fin.baked || (fin.ground && fin.ground.offendingFrames > 0)) notices.push(describeGroundContact(fin))
+      const vmdBytes = fin.vmd
       await playVmdOnStage(vmdBytes, {
         baseRotated: mpl2.baseRotated,
         legsKeyed: mpl2.legsKeyed,

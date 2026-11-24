@@ -11,6 +11,7 @@ import { compileMPL2, expandHandPresets, ensureMain } from "../src/lib/mpl2.ts"
 import { readVmdBoneKeys, solveFrameWorld } from "../src/lib/fk.ts"
 import { auditVmd } from "../src/lib/pose-audit.ts"
 import { critiquePoseVmd } from "../src/lib/pose-critic.ts"
+import { finalizeMotion } from "../src/lib/motion-finalize.ts"
 import { POSE_EXEMPLARS, retrievePoseExemplars } from "../src/lib/pose-exemplars.ts"
 import { pickPeakPoseFrame, pickStoryboardSamples, renderPoseMultiViewPng, renderStoryboardPng } from "../src/lib/pose-renderer.ts"
 import { parseVisualCriticJson, runVisualCritic, summarizeActiveMorphsAtFrame } from "../src/lib/visual-critic.ts"
@@ -281,14 +282,17 @@ test("pose-critic: 优质姿态通过，肘部上翻与遮眼错误精准拦截"
 })
 
 console.log("[4] Phase 2 Harness: 双语 RAG 示例检索 + 停留呼吸 + 安全眨眼")
-test("全部 POSE_EXEMPLARS 均零错误编译并通过运动学 Critic", () => {
+test("全部 POSE_EXEMPLARS 均零错误编译并通过运动学 Critic（成品管线：增强 + 贴地烘焙）", () => {
   assert.ok(POSE_EXEMPLARS.length >= 13)
   for (const ex of POSE_EXEMPLARS) {
     const wrapped = ensureMain(ex.mpl)
     const res = compileMPL2(compiler, wrapped, topaz)
     assert.ok(res.vmd.length > 0, `${ex.id} empty VMD`)
     assert.equal(res.directiveErrors.length, 0, `${ex.id} directiveErrors: ${res.directiveErrors.join(", ")}`)
-    const rep = critiquePoseVmd(topaz, res.vmd, wrapped)
+    // 判定对象 = 舞台实际播放的成品（增强 + 贴地烘焙），与 MCP compile_and_inspect_mpl2 同源。
+    // 过渡段关键帧之间的下沉由烘焙修掉；作者姿势本身的错误照样会被 critic 拦下。
+    const fin = finalizeMotion(auditVmd(res.vmd, topaz).vmd, topaz, { mplSource: wrapped, enhanceOptions: { autoBlink: true } })
+    const rep = critiquePoseVmd(topaz, fin.vmd, wrapped)
     assert.ok(rep && rep.passed, `${ex.id} critic failed: ${rep?.summary}`)
   }
 })

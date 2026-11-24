@@ -3,6 +3,7 @@ import fs from "node:fs"
 import { spawn } from "node:child_process"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { readVmdBoneKeys } from "../src/lib/fk.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(__dirname, "..")
@@ -145,7 +146,10 @@ try {
   const exported = JSON.parse(exportRes.content[0].text)
   assert.equal(exported.ok, true)
   assert(exported.vmdBytes > 0)
-  console.log(`  ok  export_motion (vmdBytes=${exported.vmdBytes})`)
+  assert.equal(typeof exported.baked, "boolean")
+  assert(exported.groundContact && exported.groundContact.feet, "final export must carry ground telemetry")
+  assert.match(exported.vmdSha256, /^[0-9a-f]{64}$/)
+  console.log(`  ok  export_motion (vmdBytes=${exported.vmdBytes}, baked=${exported.baked}, ground=${exported.groundNotes[0] ?? "clean"})`)
 
   // Regression: broken squat-standard-3x.mpl must be caught by floating_foot + biomechanics + blocked on export
   const badSquatPath = path.join(root, ".tmp/mcp-verify/squat-standard-3x.mpl")
@@ -158,12 +162,15 @@ try {
     assert(badRes.critic.issues.some((i) => i.code === "floating_foot"), "Must catch symmetric floating_foot at 2.4s")
     assert(badRes.actionableWarnings.some((w) => w.includes('unknown face morph "まじめ"')))
     assert(badRes.actionableWarnings.some((w) => w.includes("hipBackShift")))
+    // Ground bake fixes frame-between sinking only — an authored floating-foot key pose must survive it untouched.
+    assert(badRes.groundContact && badRes.groundContact.feet, "groundContact telemetry must be present")
     const blockedExport = JSON.parse(
       (await rpc("tools/call", { name: "export_motion", arguments: { mpl: badSquatMpl, modelId: "topaz", pushToStage: false } })).content[0].text
     )
     assert.equal(blockedExport.ok, false)
     assert.equal(blockedExport.blockedByQualityGate, true)
-    console.log("  ok  broken squat caught & blocked by quality gate")
+    assert(blockedExport.critic.issues.some((i) => i.code === "floating_foot"), "Export gate must still name floating_foot")
+    console.log(`  ok  broken squat caught & blocked by quality gate (groundBake applied=${badRes.groundBake?.applied})`)
   }
 
   // Standard squat following inspect_pmx guide must pass cleanly with grounded feet & hip-hinge
@@ -220,7 +227,15 @@ main {
   assert(bottomPt && Math.abs(bottomPt.footLiftL) < 0.2, `Expected grounded feet, got footLiftL=${bottomPt?.footLiftL}`)
   assert(bottomPt && bottomPt.hipBackShift >= 1.5, `Expected hips pushed back, got hipBackShift=${bottomPt?.hipBackShift}`)
   assert(bottomPt && bottomPt.hipDrop >= 4.0, `Expected deep hipDrop, got hipDrop=${bottomPt?.hipDrop}`)
-  console.log(`  ok  standard squat passed (hipDrop=${bottomPt.hipDrop}u, hipBack=${bottomPt.hipBackShift}u, footLift=${bottomPt.footLiftL}u)`)
+  // Verdict is on the FINAL motion: every rendered frame within tolerance, transition sinking fixed by the bake.
+  assert.equal(goodRes.groundContact.offendingFrames, 0, `Ground: ${JSON.stringify(goodRes.groundContact)}`)
+  assert.equal(goodRes.groundBake.applied, true, "stand→squat transition sinks between keys; the bake must engage")
+  assert.equal(goodRes.groundBake.residualAtEntries, 0)
+  assert(goodRes.finalKeyCount > goodRes.rawKeyCount, "final = enhanced + baked, so it carries more keys than the raw compile")
+  console.log(
+    `  ok  standard squat passed (hipDrop=${bottomPt.hipDrop}u, hipBack=${bottomPt.hipBackShift}u, footLift=${bottomPt.footLiftL}u; ` +
+      `raw critic ${goodRes.criticRaw ? "FAIL → fixed by ground bake" : "pass"}, +${goodRes.groundBake.insertedKeys} bake keys, keys ${goodRes.rawKeyCount}→${goodRes.finalKeyCount})`
+  )
 
   // Blocking export for Blender handoff + inspect_vmd_file + push_vmd_to_stage gate
   const handoffBase = ".tmp/test-handoff/squat-blocking"
@@ -238,7 +253,18 @@ main {
   assert.equal(blockingExport.stagePush.skipped, true)
   assert(blockingExport.blenderHandoff?.vmdPath && fs.existsSync(blockingExport.blenderHandoff.vmdPath))
   assert.equal(blockingExport.blenderHandoff.importArgs.margin, 0)
-  console.log(`  ok  export_motion (mode=blocking, bytes=${blockingExport.vmdBytes})`)
+  // Guardrail: blocking keys are never enhanced, never baked — byte-for-byte the sparse compile output.
+  assert.equal(blockingExport.baked, false)
+  assert.equal(blockingExport.groundBake, null)
+  // …but the gate is judged on a ground-baked preview of those keys, so blocking and final agree.
+  assert.equal(blockingExport.qualityGate?.passed, true, JSON.stringify(blockingExport.qualityGate))
+  assert.equal(blockingExport.qualityGate?.groundContact?.offendingFrames, 0)
+  assert(blockingExport.groundContact.offendingFrames > 0, "un-baked blocking keys do sink between keys — that is what Blender/polish handles")
+  const blockingKeys = readVmdBoneKeys(new Uint8Array(fs.readFileSync(blockingExport.blenderHandoff.vmdPath)))
+  assert.equal(blockingKeys.length, goodRes.rawKeyCount, "blocking VMD key count must equal the raw compile")
+  console.log(
+    `  ok  export_motion (mode=blocking, bytes=${blockingExport.vmdBytes}, keys=${blockingKeys.length} = raw compile, unbaked; gate on baked preview)`
+  )
 
   const inspectedVmd = await rpc("tools/call", {
     name: "inspect_vmd_file",
@@ -246,9 +272,17 @@ main {
   })
   assert.equal(inspectedVmd.content[0].type, "image")
   const vmdReport = JSON.parse(inspectedVmd.content[1].text)
-  assert.equal(vmdReport.ok, true)
   assert(vmdReport.boneKeyCount > 0)
-  console.log(`  ok  inspect_vmd_file (keys=${vmdReport.boneKeyCount}, dur=${vmdReport.durationSec}s)`)
+  assert(vmdReport.groundContact && vmdReport.groundContact.feet, "inspect_vmd_file must carry ground telemetry")
+  // The blocking file is un-baked by design: judged as-is it sinks between keys (ok=false, it would fail the stage gate),
+  // while the bake preview shows the standard ground bake would fix every frame.
+  assert(vmdReport.groundContact.offendingFrames > 0, "un-baked blocking VMD must report frame-between sinking")
+  assert.equal(vmdReport.groundBakePreview?.after?.offendingFrames, 0, JSON.stringify(vmdReport.groundBakePreview))
+  assert(vmdReport.groundNotes.some((n) => n.includes('mode="blocking"')), JSON.stringify(vmdReport.groundNotes))
+  console.log(
+    `  ok  inspect_vmd_file (keys=${vmdReport.boneKeyCount}, dur=${vmdReport.durationSec}s, as-is ok=${vmdReport.ok}, ` +
+      `bake preview: +${vmdReport.groundBakePreview.insertedKeys} keys → ${vmdReport.groundBakePreview.after.offendingFrames} offending)`
+  )
 
   // Quality gate on push_vmd_to_stage must block broken VMD
   const badVmdPath = path.join(root, ".tmp/mcp-verify/squat-standard-3x.vmd")

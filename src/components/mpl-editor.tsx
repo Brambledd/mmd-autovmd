@@ -2,10 +2,11 @@ import { useCallback, useState, useEffect, useRef } from "react"
 import { Button } from "./ui/button"
 import { Download, Upload } from "lucide-react"
 import { useMPLCompiler } from "@/hooks/useMPLCompiler"
-import { computeIkSchedule, enhanceVmd } from "@/lib/vmd-enhancer"
+import { computeIkSchedule } from "@/lib/vmd-enhancer"
 import type { IkWindow } from "@/lib/vmd-enhancer"
 import { auditVmd } from "@/lib/pose-audit"
 import { compileMPL2 } from "@/lib/mpl2"
+import { finalizeMotion } from "@/lib/motion-finalize"
 import { getActiveModelBones, MODEL_URL } from "@/lib/model"
 import CodeEditor from "./code-editor"
 import Link from "next/link"
@@ -213,8 +214,13 @@ main {
         // Phase 2 几何层：FK 胶囊碰撞预检 + 违例链自动回退（骨骼缺失则跳过）
         const audited = bones ? auditVmd(compiled, bones).vmd : compiled
         // Polish the compiled motion: easing curves, anticipation/overshoot/
-        // settle keys, chain stagger, planted feet (see src/lib/vmd-enhancer.ts).
-        const vmdBytes = enhanceVmd(audited, { autoBlink: true })
+        // settle keys, chain stagger, planted feet (see src/lib/vmd-enhancer.ts),
+        // then ground-contact bake — the same finalize pipeline the stage chat
+        // playback and MCP export_motion(final) use (what you see is what ships).
+        const vmdBytes = finalizeMotion(audited, bones, {
+          mplSource: statement,
+          enhanceOptions: { autoBlink: true },
+        }).vmd
         if (cancelled) return
         setCompileError(null)
         if (vmdBytes.length === 0) {

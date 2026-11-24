@@ -7,7 +7,16 @@
  */
 
 import { detectPosSemantics, restWorldPositions } from "./model-geometry.ts"
-import { analyzeGroundContactKeys, qRotate, readVmdBoneKeys, solveFrameTransforms } from "./fk.ts"
+import {
+  analyzeGroundContactKeys,
+  buildBoneTracks,
+  integerFrames,
+  qRotate,
+  readVmdBoneKeys,
+  sampleBoneTracks,
+  samplePoseTransforms,
+  solveFrameTransforms,
+} from "./fk.ts"
 import type { Vec3, VmdBoneKey } from "./fk.ts"
 import type { PmxBones } from "./pmx-bones.ts"
 import { secondsToFrame } from "./vmd-morph.ts"
@@ -40,6 +49,17 @@ export interface PoseCritiqueIssue {
   severity: "error" | "warn"
   message: string
   fixHint: string
+  /** 连续多帧命中同一问题时：末帧号与命中帧数（相邻帧已合并成一条） */
+  frameEnd?: number
+  frameCount?: number
+}
+
+/** 检查器的取帧方式：interpolated = 舞台实际渲染的每一帧（关键帧之间按引擎规则插值）；keyframes = 只看关键帧。 */
+export type CriticSampling = "interpolated" | "keyframes"
+
+export interface CriticOptions {
+  /** 缺省 "interpolated"（与舞台一致）；"keyframes" 为旧行为（step-hold，只看关键帧） */
+  sampling?: CriticSampling
 }
 
 export interface CriticOffendingSegment {
@@ -55,6 +75,8 @@ export interface PoseCritiqueReport {
   issues: PoseCritiqueIssue[]
   offendingSegments: CriticOffendingSegment[]
   summary: string
+  /** 本次检查的取帧方式（见 CriticSampling） */
+  sampling?: CriticSampling
 }
 
 interface ParsedAnimRef {
@@ -62,7 +84,7 @@ interface ParsedAnimRef {
   refs: string[]
 }
 
-function parsePoseTextsAndTimeline(mplSource: string): {
+export function parsePoseTextsAndTimeline(mplSource: string): {
   poseBodyByName: Map<string, string>
   frames: ParsedAnimRef[]
 } {
@@ -134,22 +156,82 @@ function isOverheadIntent(poseText: string, poseRefs: string, side: "l" | "r"): 
 }
 
 /**
+ * 逐帧求值时同一问题会连续命中多帧：按 code + 段落把相邻帧（间隔 ≤1 帧）合并成一条，
+ * 保留首帧的帧号/时间，并附 frameEnd / frameCount。返回按帧号排序的列表。
+ */
+function mergeConsecutiveIssues(issues: PoseCritiqueIssue[]): PoseCritiqueIssue[] {
+  if (issues.length <= 1) return issues
+  const order: CriticIssueCode[] = []
+  const byCode = new Map<CriticIssueCode, PoseCritiqueIssue[]>()
+  for (const i of issues) {
+    let list = byCode.get(i.code)
+    if (!list) {
+      list = []
+      byCode.set(i.code, list)
+      order.push(i.code)
+    }
+    list.push(i)
+  }
+
+  const out: PoseCritiqueIssue[] = []
+  for (const code of order) {
+    const runs: PoseCritiqueIssue[][] = []
+    let current: PoseCritiqueIssue[] | null = null
+    let lastSeg: number | undefined
+    let lastFrame = Number.NEGATIVE_INFINITY
+    for (const i of byCode.get(code) ?? []) {
+      if (!current || i.segmentIndex !== lastSeg || i.frame - lastFrame > 1) {
+        current = []
+        runs.push(current)
+        lastSeg = i.segmentIndex
+      }
+      current.push(i)
+      lastFrame = i.frame
+    }
+    for (const run of runs) {
+      const head = run[0]
+      if (run.length === 1) {
+        out.push(head)
+        continue
+      }
+      out.push({
+        ...head,
+        frameEnd: run[run.length - 1].frame,
+        frameCount: run.length,
+        message: `${head.message} — persists for ${run.length} frames (to t=${run[run.length - 1].time}s)`,
+      })
+    }
+  }
+  out.sort((a, b) => a.frame - b.frame)
+  return out
+}
+
+/**
  * Deterministic kinematic critique over a compiled VMD + MPL source.
  * Checks ground contact, elbow flip above shoulder, hand blocking eyes on mouth/chin reach,
  * and extreme standing spine overhang.
+ *
+ * 取帧：缺省在舞台实际渲染的每一帧（0..maxFrame，关键帧之间按 reze-engine 规则插值）上求值，
+ * 所以关键帧之间的下沉/漂移也会被抓到；同一问题连续命中多帧会合并成一条（frameEnd/frameCount）。
  */
 export function critiquePoseVmd(
   bones: PmxBones,
   vmd: Uint8Array,
   mplSource: string,
-  timeline?: Array<{ index: number; start: number; end: number }>
+  timeline?: Array<{ index: number; start: number; end: number }>,
+  opts: CriticOptions = {}
 ): PoseCritiqueReport | null {
   try {
     const keys = readVmdBoneKeys(vmd)
     if (!keys || keys.length === 0) return null
 
+    const interpolated = opts.sampling !== "keyframes"
     const semantics = detectPosSemantics(bones)
-    const ground = analyzeGroundContactKeys(bones, keys)
+    const sortedKeys = [...keys].sort((a, b) => a.frame - b.frame)
+    const distinctFrames = [...new Set(sortedKeys.map((k) => k.frame))].sort((a, b) => a - b)
+    const evalFrames = interpolated ? integerFrames(keys) : distinctFrames
+    const tracks = interpolated ? buildBoneTracks(keys) : null
+    const ground = analyzeGroundContactKeys(bones, keys, interpolated ? { interpolated: true, frames: evalFrames } : {})
     const { poseBodyByName, frames: animRefs } = parsePoseTextsAndTimeline(mplSource)
 
     // Group step-hold pose text and ref names by frame sorted chronologically
@@ -158,9 +240,6 @@ export function critiquePoseVmd(
       const combined = af.refs.map((r) => poseBodyByName.get(r) ?? "").join("\n")
       animTimeline.push({ frame: af.frame, text: combined, refs: af.refs.join(" ") })
     }
-
-    const sortedKeys = [...keys].sort((a, b) => a.frame - b.frame)
-    const distinctFrames = [...new Set(sortedKeys.map((k) => k.frame))].sort((a, b) => a - b)
 
     const issues: PoseCritiqueIssue[] = []
     const bySeg = new Map<number, CriticOffendingSegment>()
@@ -187,7 +266,7 @@ export function critiquePoseVmd(
       }
     }
 
-    // Build step-hold key map sequentially across distinct frames
+    // 每帧骨骼状态：interpolated = 按引擎规则在关键帧之间插值；keyframes = 旧的 step-hold
     const state = new Map<string, VmdBoneKey>()
     let ki = 0
     let ai = 0
@@ -203,7 +282,7 @@ export function critiquePoseVmd(
         ? Math.min(restWorld.get(restAnkleLIdx)?.y ?? 1.5, restWorld.get(restAnkleRIdx)?.y ?? 1.5)
         : 1.5
 
-    for (const f of distinctFrames) {
+    for (const f of evalFrames) {
       while (ki < sortedKeys.length && sortedKeys[ki].frame <= f) {
         state.set(sortedKeys[ki].jp, sortedKeys[ki])
         ki++
@@ -215,13 +294,21 @@ export function critiquePoseVmd(
         activeHistory.push({ ...animTimeline[ai], endFrame })
         ai++
       }
+      // 过渡段（f 落在两个时间轴条目之间）同时受“来姿”和“去姿”的意图约束：
+      // 起跳段/踢腿抬腿段的腾空是设计意图，不能因为下一姿还没到就判悬空。到达帧只看当前姿。
+      const nextEntry = ai < animTimeline.length ? animTimeline[ai] : null
+      const atTimelineKey = ai > 0 && animTimeline[ai - 1].frame === f
+      const ctxText = nextEntry && !atTimelineKey ? `${activeText}\n${nextEntry.text}` : activeText
+      const ctxRefs = nextEntry && !atTimelineKey ? `${activeRefs} ${nextEntry.refs}` : activeRefs
       const isOverheadRecent = (side: "l" | "r") =>
-        isOverheadIntent(activeText, activeRefs, side) ||
+        isOverheadIntent(ctxText, ctxRefs, side) ||
         activeHistory.some((h) => h.frame <= f && f <= h.endFrame + 8 && isOverheadIntent(h.text, h.refs, side))
       // Skip frame 0 reset/rest check unless it's the only frame
-      if (f === 0 && distinctFrames.length > 1) continue
+      if (f === 0 && evalFrames.length > 1) continue
 
-      const tf = solveFrameTransforms(bones, state, semantics)
+      const tf = tracks
+        ? solveFrameTransforms(bones, sampleBoneTracks(tracks, f), semantics)
+        : solveFrameTransforms(bones, state, semantics)
       if (!tf) continue
       const at = (jp: string) => {
         const idx = bones.indexByJp.get(jp)
@@ -375,16 +462,40 @@ export function critiquePoseVmd(
         ankleR &&
         kneeL &&
         kneeR &&
-        !/\b(kick|jump|jumping_jack|base\s+bend|base\s+sway|center\s+move\s+up)\b/i.test(activeText) &&
-        !/\b(jumping_jack|jack_idle|jack_out)\b/i.test(activeRefs)
+        !/\b(kick|jump|jumping_jack|base\s+bend|base\s+sway|center\s+move\s+up)\b/i.test(ctxText) &&
+        !/\b(jumping_jack|jack_idle|jack_out)\b/i.test(ctxRefs)
       ) {
         const lowY = Math.min(ankleL.y, ankleR.y)
         const highY = Math.max(ankleL.y, ankleR.y)
         const highKneeY = ankleL.y >= ankleR.y ? kneeL.y : kneeR.y
         const highSide = ankleL.y >= ankleR.y ? "left" : "right"
         const isSeatedPose =
-          /\b(sit|sitting|sitting_start|risen)\b/i.test(activeRefs) || /\bsit\b/i.test(activeText)
-        if (lowY <= 2.3 && highY > 3.8 && highKneeY > 3.2) {
+          /\b(sit|sitting|sitting_start|risen)\b/i.test(ctxRefs) || /\bsit\b/i.test(ctxText)
+        // 过渡段里“一脚高抬、膝盖还高”是抬脚落位的过程，不是定格姿势的毛病：
+        // 连续模式下只在该帧双脚几乎不动（±2 帧位移 < 0.2u）时才按“悬空”报错。
+        const quasiStatic = (() => {
+          if (!tracks) return true
+          const pick = (t: number) => {
+            const s = samplePoseTransforms(bones, tracks, t, semantics)?.pos
+            if (!s) return null
+            const atIdx = (jp: string) => {
+              const i = bones.indexByJp.get(jp)
+              return i != null ? s[i] : undefined
+            }
+            const l = atIdx("左足首D") ?? atIdx("左足首")
+            const r = atIdx("右足首D") ?? atIdx("右足首")
+            return l && r ? [l, r] : null
+          }
+          const before = pick(Math.max(0, f - 2))
+          const after = pick(f + 2)
+          if (!before || !after) return true
+          const move = Math.max(
+            Math.hypot(before[0].x - after[0].x, before[0].y - after[0].y, before[0].z - after[0].z),
+            Math.hypot(before[1].x - after[1].x, before[1].y - after[1].y, before[1].z - after[1].z)
+          )
+          return move < 0.2
+        })()
+        if (quasiStatic && lowY <= 2.3 && highY > 3.8 && highKneeY > 3.2) {
           recordIssue({
             code: "floating_foot",
             segmentIndex: segIdx,
@@ -408,7 +519,7 @@ export function critiquePoseVmd(
           })
         }
       }
-      if (center && head && ankleL && ankleR && center.y > 5.5 && !/\bbase\s+(bend|sway)/i.test(activeText)) {
+      if (center && head && ankleL && ankleR && center.y > 5.5 && !/\bbase\s+(bend|sway)/i.test(ctxText)) {
         const footMidX = (ankleL.x + ankleR.x) / 2
         const footMidZ = (ankleL.z + ankleR.z) / 2
         const overhang = Math.hypot(head.x - footMidX, head.z - footMidZ)
@@ -426,17 +537,27 @@ export function critiquePoseVmd(
       }
     }
 
-    const errors = issues.filter((x) => x.severity === "error")
+    const merged = mergeConsecutiveIssues(issues)
+    const segments = [...bySeg.values()].sort((a, b) => a.index - b.index)
+    for (const seg of segments) {
+      const own = merged.filter((m) => m.segmentIndex === seg.index)
+      const seen = new Set<PoseCritiqueIssue>()
+      seg.issues = own.filter((m) => !seen.has(m) && seen.add(m))
+      seg.times = [...new Set(own.map((m) => m.time))].sort((a, b) => a - b)
+    }
+
+    const errors = merged.filter((x) => x.severity === "error")
     const summary =
       errors.length === 0
-        ? `kinematic critic passed (${distinctFrames.length} frames checked${issues.length > 0 ? `, ${issues.length} warning(s)` : ""})`
+        ? `kinematic critic passed (${evalFrames.length} ${interpolated ? "rendered" : "key"} frames checked${merged.length > 0 ? `, ${merged.length} warning(s)` : ""})`
         : `${errors.length} kinematic issue(s): ${errors.map((e) => e.code).filter((v, idx, a) => a.indexOf(v) === idx).join(", ")}`
 
     return {
       passed: errors.length === 0,
-      issues,
-      offendingSegments: [...bySeg.values()].sort((a, b) => a.index - b.index),
+      issues: merged,
+      offendingSegments: segments,
       summary,
+      sampling: interpolated ? "interpolated" : "keyframes",
     }
   } catch {
     return null

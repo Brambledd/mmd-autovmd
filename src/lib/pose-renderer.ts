@@ -8,8 +8,8 @@
  */
 
 import { deflateSync } from "node:zlib"
-import { qRotate, readVmdBoneKeys, solveFrameTransforms } from "./fk.ts"
-import type { Quat, Vec3, VmdBoneKey } from "./fk.ts"
+import { buildBoneTracks, qRotate, readVmdBoneKeys, sampleBoneTracks, solveFrameTransforms } from "./fk.ts"
+import type { BoneTracks, Quat, Vec3, VmdBoneKey } from "./fk.ts"
 import { detectPosSemantics, measureModelGeometry } from "./model-geometry.ts"
 import type { PmxBones } from "./pmx-bones.ts"
 
@@ -503,6 +503,9 @@ const ANCHOR_LANDMARKS = [
   "左足首D", "右足首D", "左足首", "右足首", "左足先EX", "右足先EX",
 ]
 
+/** 每个场景上下文的骨骼轨道（按帧排序），供分镜各格做引擎同源插值采样。 */
+const ctxTracks = new WeakMap<SceneContext, BoneTracks>()
+
 function renderFramePanels(
   canvas: RasterCanvas,
   ctx: SceneContext,
@@ -512,11 +515,14 @@ function renderFramePanels(
   panelH: number,
   views: Array<{ kind: ViewKind; label: string; width: number }>
 ): boolean {
-  const solveMap = new Map<string, VmdBoneKey>()
-  for (const k of ctx.keys) {
-    if (k.frame <= frame) solveMap.set(k.jp, k)
+  // 与舞台引擎同源的插值采样（此前用 step-hold 取 ≤frame 的最近键，
+  // 画出来的是“最近关键帧”而不是这一帧，和连续 critic 的结论对不上）
+  let tracks = ctxTracks.get(ctx)
+  if (!tracks) {
+    tracks = buildBoneTracks(ctx.keys)
+    ctxTracks.set(ctx, tracks)
   }
-  const tf = solveFrameTransforms(ctx.bones, solveMap, ctx.semantics)
+  const tf = solveFrameTransforms(ctx.bones, sampleBoneTracks(tracks, frame), ctx.semantics)
   if (!tf) return false
 
   const posOf = (jp: string): Vec3 | undefined => {

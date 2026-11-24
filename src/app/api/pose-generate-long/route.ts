@@ -16,7 +16,9 @@ import {
 } from "@/lib/long-motion"
 import { desugarMPL } from "@/lib/mpl-macros"
 import { compileMPL2 } from "@/lib/mpl2"
+import { auditVmd } from "@/lib/pose-audit"
 import { critiquePoseVmd } from "@/lib/pose-critic"
+import { finalizeMotion } from "@/lib/motion-finalize"
 import { formatExemplarsForPrompt, retrievePoseExemplars } from "@/lib/pose-exemplars"
 import { renderPoseMultiViewPng, renderStoryboardPng } from "@/lib/pose-renderer"
 import type { StoryboardTimelineEntry } from "@/lib/pose-renderer"
@@ -183,6 +185,23 @@ function validateFragment(
   } catch (e) {
     return `compiler rejected the MPL: ${e instanceof Error ? e.message : String(e)}`
   }
+}
+
+/**
+ * 成品管线：审核 → vmd-enhancer → 贴地烘焙。与舞台 playMplOnStage、MCP export_motion(final) 同源。
+ * 自愈回路的 critic 与分镜都看成品 —— 过渡段的帧间下沉由烘焙修掉，
+ * 不再因为“关键帧之间”的问题触发无谓的定向重生成；作者姿势本身的错误照样会被拦。
+ */
+function finalizeForStage(
+  vmd: Uint8Array,
+  bones: ReturnType<typeof deserializePmxBones> | null,
+  mplSource: string
+): Uint8Array {
+  if (vmd.length === 0 || !bones) return vmd
+  return finalizeMotion(auditVmd(vmd, bones).vmd, bones, {
+    mplSource,
+    enhanceOptions: { autoBlink: true },
+  }).vmd
 }
 
 type PipelineRequest = {
@@ -540,8 +559,9 @@ async function executeLongPosePipeline(
         warnings.push("server-side compile returned 0 bytes — stitched script may fail client compile")
         break
       }
-      lastCompiledVmd = mpl2res.vmd
-      const report = critiquePoseVmd(fkBones, mpl2res.vmd, stitched.script, stitched.timeline)
+      // 成品（增强 + 贴地烘焙）才是舞台实际播放的东西 → critic 看成品
+      lastCompiledVmd = finalizeForStage(mpl2res.vmd, fkBones, stitched.script)
+      const report = critiquePoseVmd(fkBones, lastCompiledVmd, stitched.script, stitched.timeline)
       if (!report) break
       fkSummary = report.summary
       criticIssues = report.issues.map((x) => ({ code: x.code, message: x.message }))
@@ -616,7 +636,7 @@ async function executeLongPosePipeline(
       stitched = stitchSegments(currentInputs, { seamless: true })
       try {
         const recompiled = compileMPL2(serverCompiler, stitched.script, fkBones)
-        if (recompiled.vmd.length > 0) lastCompiledVmd = recompiled.vmd
+        if (recompiled.vmd.length > 0) lastCompiledVmd = finalizeForStage(recompiled.vmd, fkBones, stitched.script)
       } catch { /* ignore */ }
     }
   }
@@ -731,11 +751,12 @@ async function executeLongPosePipeline(
                 candidateInputs[safeIdx] = { fragment: cleaned, duration: Math.max(dur, meta.duration) }
                 const candStitched = stitchSegments(candidateInputs, { seamless: true })
                 const candCompiled = compileMPL2(serverCompiler, candStitched.script, fkBones)
-                const candCritic = critiquePoseVmd(fkBones, candCompiled.vmd, candStitched.script, candStitched.timeline)
+                const candFinal = finalizeForStage(candCompiled.vmd, fkBones, candStitched.script)
+                const candCritic = critiquePoseVmd(fkBones, candFinal, candStitched.script, candStitched.timeline)
                 if (candCompiled.vmd.length > 0 && candCritic?.passed) {
                   currentInputs[safeIdx] = candidateInputs[safeIdx]
                   stitched = candStitched
-                  lastCompiledVmd = candCompiled.vmd
+                  lastCompiledVmd = candFinal
                   fkSummary = candCritic.summary
                   criticIssues = candCritic.issues.map((x) => ({ code: x.code, message: x.message }))
                   segmentMeta[safeIdx] = {
@@ -757,8 +778,8 @@ async function executeLongPosePipeline(
                     }))
                     const rerendered =
                       criticMode === "storyboard"
-                        ? renderStoryboardPng(fkBones, candCompiled.vmd, nextMeta, { maxTiles: 6 })
-                        : renderPoseMultiViewPng(fkBones, candCompiled.vmd)
+                        ? renderStoryboardPng(fkBones, candFinal, nextMeta, { maxTiles: 6 })
+                        : renderPoseMultiViewPng(fkBones, candFinal)
                     if (rerendered) previewDataUrl = rerendered.dataUrl
                   }
                 } else if (candCritic && !candCritic.passed) {

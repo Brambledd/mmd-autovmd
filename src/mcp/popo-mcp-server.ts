@@ -15,6 +15,7 @@
 
 import fs from "node:fs"
 import path from "node:path"
+import crypto from "node:crypto"
 import readline from "node:readline"
 import { fileURLToPath } from "node:url"
 
@@ -33,10 +34,11 @@ import { VALID_AIM_TARGETS, VALID_REACH_ANCHORS } from "../lib/ik-solver.ts"
 import { LEXICON } from "../lib/motion-lexicon.ts"
 import { critiquePoseVmd } from "../lib/pose-critic.ts"
 import { auditVmd } from "../lib/pose-audit.ts"
-import { readVmdBoneKeys, solveFrameTransforms } from "../lib/fk.ts"
+import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
 import { renderPoseMultiViewPng, renderStoryboardPng } from "../lib/pose-renderer.ts"
-import { enhanceVmd } from "../lib/vmd-enhancer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
+import { measureGroundErrorVmd, summarizeGroundMeasure } from "../lib/ground-bake.ts"
+import { finalizeMotion, type FinalizeResult } from "../lib/motion-finalize.ts"
 import { secondsToFrame } from "../lib/vmd-morph.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -95,10 +97,15 @@ function getRestAnchors(bones: PmxBones) {
   }
 }
 
+/**
+ * 按舞台引擎的插值规则在指定时刻采样骨骼世界坐标（与 kinematic critic、贴地测量同源）。
+ * 曾用 step-hold（取 ≤f 的最近键），会漏掉关键帧之间的下沉/漂浮，与连续检查器结论对不上。
+ */
 function extractKeyframeCoords(bones: PmxBones, vmd: Uint8Array, sampleTimes?: number[]) {
   const keys = readVmdBoneKeys(vmd)
   if (!keys || keys.length === 0) return []
   const sem = detectPosSemantics(bones)
+  const tracks = buildBoneTracks(keys)
   const geom = measureModelGeometry(bones)
   const { restAnkleY, restCenterY, restCenterZ } = getRestAnchors(bones)
 
@@ -123,11 +130,7 @@ function extractKeyframeCoords(bones: PmxBones, vmd: Uint8Array, sampleTimes?: n
     a && b ? r2(Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z)) : null
 
   return frames.map((f) => {
-    const state = new Map<string, (typeof keys)[number]>()
-    for (const k of keys) {
-      if (k.frame <= f) state.set(k.jp, k)
-    }
-    const tf = solveFrameTransforms(bones, state, sem)
+    const tf = samplePoseTransforms(bones, tracks, f, sem)
     const at = (jp: string) => {
       const idx = bones.indexByJp.get(jp)
       const p = idx != null && tf ? tf.pos[idx] : undefined
@@ -168,6 +171,91 @@ function extractKeyframeCoords(bones: PmxBones, vmd: Uint8Array, sampleTimes?: n
       armExtensionRatioL: dL != null && geom.armLenUnits > 0 ? r2(dL / geom.armLenUnits) : null,
     }
   })
+}
+
+/**
+ * 成品的逐帧贴地报告：每只脚相对静止脚踝/脚尖高度的偏移（负 = 沉入地面）、
+ * 烘焙统计，以及给 Agent 的结论句。blocking 模式没有烘焙（bake=null）。
+ */
+function groundReport(fin: FinalizeResult) {
+  const g = fin.ground
+  const bs = fin.bakeStats
+  const notes: string[] = []
+  if (g && g.offendingFrames > 0) {
+    const side = g.feet.l.offending >= g.feet.r.offending ? "left" : "right"
+    const s = side === "left" ? g.feet.l : g.feet.r
+    notes.push(
+      `${g.offendingFrames} rendered frame(s) still off the floor by >${g.tolerance}u ` +
+        `(worst foot ${side}: min ${s.min.toFixed(3)}u @f${s.minFrame}, max ${s.max.toFixed(3)}u @f${s.maxFrame})`
+    )
+  }
+  if (bs && bs.residualAtEntries > 0) {
+    notes.push(
+      `${bs.residualAtEntries} of those are authored key poses (ground bake never rewrites key poses) — ` +
+        `add "plant feet;" to the pose(s) at those frames, or accept the offset`
+    )
+  }
+  return {
+    ground: g,
+    bake: bs
+      ? {
+          applied: bs.applied,
+          skippedReason: bs.skippedReason,
+          entriesFrom: bs.entriesFrom,
+          passes: bs.passes,
+          insertedKeys: bs.insertedKeys,
+          centerKeys: bs.centerKeys,
+          ankleKeys: bs.ankleKeys,
+          anchorKeys: bs.anchorKeys,
+          residualFrames: bs.residualFrames,
+          residualAtEntries: bs.residualAtEntries,
+          windows: bs.windows,
+          before: bs.before,
+        }
+      : null,
+    notes,
+  }
+}
+
+/** blocking 导出的贴地说明：导出的是未烘焙的稀疏键，帧间偏差属预期；标准烘焙预览的结果才是闸门依据。 */
+function blockingGroundNotes(fin: FinalizeResult, gate: FinalizeResult): string[] {
+  const g = fin.ground
+  const p = gate.ground
+  if (!g || !p) return []
+  const sink = Math.min(0, g.feet.l.min, g.feet.r.min)
+  const head =
+    g.offendingFrames === 0
+      ? "blocking keys are exported un-baked and already keep both feet on the floor on every rendered frame"
+      : `blocking keys are exported un-baked: ${g.offendingFrames} foot-frame(s) deviate between keys (deepest sink ${sink.toFixed(3)}u)`
+  const tail =
+    p.offendingFrames === 0
+      ? "; the standard ground bake fixes all of them (quality gate passed on that preview)"
+      : `; ${p.offendingFrames} foot-frame(s) remain after the standard ground bake (see qualityGate.groundContact)`
+  return [head + tail]
+}
+
+/** render_pose_views 文本输出用的一行英文贴地结论（舞台端中文版见 motion-finalize.describeGroundContact）。 */
+function describeGroundEn(fin: FinalizeResult): string {
+  const g = fin.ground
+  if (!g) return "n/a"
+  const bs = fin.bakeStats
+  const head =
+    g.offendingFrames === 0
+      ? `all ${g.frames} rendered frames within ±${g.tolerance}u of rest foot height`
+      : `${g.offendingFrames} frame(s) beyond ±${g.tolerance}u`
+  const feet = `L min ${g.feet.l.min.toFixed(3)}u / max ${g.feet.l.max.toFixed(3)}u, R min ${g.feet.r.min.toFixed(3)}u / max ${g.feet.r.max.toFixed(3)}u`
+  const bake = bs
+    ? bs.applied
+      ? `; ground bake inserted ${bs.insertedKeys} key(s)`
+      : `; ground bake not applied (${bs.skippedReason ?? "n/a"})`
+    : ""
+  return `${head} (${feet})${bake}`
+}
+
+/** 外部 VMD（无 MPL 源）的逐帧贴地摘要。 */
+function groundSummaryOf(bones: PmxBones, vmd: Uint8Array) {
+  const m = measureGroundErrorVmd(vmd, bones)
+  return m ? summarizeGroundMeasure(m) : null
 }
 
 function buildBiomechanicalWarnings(
@@ -298,7 +386,7 @@ const TOOLS = [
   {
     name: "compile_and_inspect_mpl2",
     description:
-      "Compile an MPL2 script to VMD and run deterministic FK kinematics, foot-lift/hip-hinge biomechanics, morph validation, and self-collision checks (checking both raw and enhanced VMD). Returns exact 3D coordinates, footLiftL/R, hipDrop, hipBackShift, squatDepthRatio, armExtensionRatio, and actionableWarnings.",
+      "Compile an MPL2 script to VMD and run deterministic FK kinematics on EVERY rendered frame (engine-accurate bezier/slerp interpolation), foot-lift/hip-hinge biomechanics, morph validation, and self-collision checks. The verdict (ok / critic) is on the FINAL motion (vmd-enhancer + ground-contact bake — exactly what the stage plays and export_motion final writes); criticRaw is attached only when the raw compile itself fails, to tell frame-between sinking (fixed by the bake) from authored-pose problems. Returns groundContact (per-frame foot height vs rest ankle/toe height; negative = below floor), groundBake stats, exact 3D coordinates at sampleTimes, footLiftL/R, hipDrop, hipBackShift, squatDepthRatio, armExtensionRatio, and actionableWarnings.",
     inputSchema: {
       type: "object",
       properties: {
@@ -317,7 +405,7 @@ const TOOLS = [
   {
     name: "render_pose_views",
     description:
-      "Compile an MPL2 script and render orthographic multi-view PNGs (single-frame Front/Side/Top or up to 6-tile Storyboard with Front + 3/4 view) plus per-tile foot-lift/hip telemetry so you can visually inspect the 3D pose and iterate.",
+      "Compile an MPL2 script and render orthographic multi-view PNGs (single-frame Front/Side/Top or up to 6-tile Storyboard with Front + 3/4 view) of the FINAL motion (vmd-enhancer + ground-contact bake) plus per-tile foot-lift/hip telemetry and a ground-contact summary so you can visually inspect the 3D pose and iterate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -338,7 +426,7 @@ const TOOLS = [
   {
     name: "export_motion",
     description:
-      "Validate, finalize, and export an MPL2 script: compiles, runs kinematic critic gate (blocks broken motions unless force=true), applies vmd-enhancer (skipped automatically when mode='blocking' for Blender handoff), optionally saves .mpl/.vmd files to disk, and optionally pushes live to the PoPo 3D web stage.",
+      "Validate, finalize, and export an MPL2 script: compiles, finalizes (mode='final': vmd-enhancer + ground-contact bake so feet stay on the floor on every rendered frame; mode='blocking': clean un-enhanced, un-baked sparse keyframes for Blender mmd_tools polish), runs the kinematic critic gate (blocks broken motions unless force=true; in blocking mode the gate is judged on a ground-baked preview of the keys because Blender handles last-mile grounding — so blocking and final agree), optionally saves .mpl/.vmd files to disk, and optionally pushes the exact final VMD bytes live to the PoPo 3D web stage. Returns groundContact / groundBake / groundNotes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -348,9 +436,9 @@ const TOOLS = [
           type: "string",
           enum: ["final", "blocking"],
           description:
-            "'blocking' exports clean un-enhanced sparse keyframes for Blender mmd_tools polish (defaults enhance=false, pushToStage=false) and returns blenderHandoff metadata. Default: 'final'.",
+            "'blocking' exports clean un-enhanced, un-baked sparse keyframes for Blender mmd_tools polish (defaults enhance=false, pushToStage=false) and returns blenderHandoff metadata. Default: 'final'.",
         },
-        enhance: { type: "boolean", description: "Apply vmd-enhancer polish (default: true in final, false in blocking)" },
+        enhance: { type: "boolean", description: "Apply vmd-enhancer polish (default: true in final, false in blocking; ignored in blocking)" },
         pushToStage: { type: "boolean", description: "Push live to running PoPo stage (default: true in final, false in blocking)" },
         stageUrl: { type: "string", description: "PoPo web server URL (default: http://127.0.0.1:4000)" },
         title: { type: "string", description: "Optional motion title shown in stage notice" },
@@ -370,7 +458,7 @@ const TOOLS = [
   {
     name: "inspect_vmd_file",
     description:
-      "Inspect an external .vmd file (e.g. exported after Blender mmd_tools polish): runs PoPo's FK kinematic critic, self-collision audit, foot-lift/hip-hinge telemetry, and optionally renders orthographic PNG views for visual verification.",
+      "Inspect an external .vmd file (e.g. exported after Blender mmd_tools polish): runs PoPo's FK kinematic critic on every rendered frame (engine-accurate interpolation), self-collision audit, foot-lift/hip-hinge telemetry, per-frame ground-contact offsets vs rest foot height — plus a ground-bake preview when the file is still un-baked (blocking exports) — and optionally renders orthographic PNG views for visual verification. ok=false means the file as-is would fail the stage quality gate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -472,18 +560,22 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
       }
     }
 
-    const keys = readVmdBoneKeys(res.vmd) ?? []
+    // 成品 = 增强 + 贴地烘焙 —— 与舞台 chat 播放、export_motion final 是同一条管线。
+    // 闸门看成品；raw 编译产物的 critic 只在它失败时附上（criticRaw），
+    // 用来区分“过渡段帧间下沉（烘焙已修）”和“作者姿势本身的问题”。
+    const audit = auditVmd(res.vmd, bones)
+    const fin = finalizeMotion(audit.vmd, bones, { mplSource: mpl, enhanceOptions: { autoBlink: true } })
+    const finalVmd = fin.vmd
+    const keys = readVmdBoneKeys(finalVmd) ?? []
     const maxFrame = keys.reduce((m, k) => Math.max(m, k.frame), 0)
     const durationSec = Number((maxFrame / 30).toFixed(2))
-    const criticRaw = critiquePoseVmd(bones, res.vmd, mpl, [{ index: 0, start: 0, end: durationSec }])
-    const audit = auditVmd(res.vmd, bones)
-    const enhancedVmd = enhanceVmd(audit.vmd, { autoBlink: true })
-    const criticEnhanced = critiquePoseVmd(bones, enhancedVmd, mpl, [{ index: 0, start: 0, end: durationSec }])
+    const timeline = [{ index: 0, start: 0, end: durationSec }]
+    const criticRaw = critiquePoseVmd(bones, res.vmd, mpl, timeline)
+    const critic = critiquePoseVmd(bones, finalVmd, mpl, timeline)
     const sampleTimes = Array.isArray(args.sampleTimes) ? args.sampleTimes.map(Number) : undefined
-    const keyframeCoords = extractKeyframeCoords(bones, res.vmd, sampleTimes)
+    const keyframeCoords = extractKeyframeCoords(bones, finalVmd, sampleTimes)
     const actionableWarnings = buildBiomechanicalWarnings(mpl, res.warnings, keyframeCoords, bones)
-
-    const criticPassed = (criticRaw?.passed ?? true) && (criticEnhanced?.passed ?? true)
+    const ground = groundReport(fin)
 
     return {
       content: [
@@ -491,16 +583,22 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
           type: "text",
           text: JSON.stringify(
             {
-              ok: res.directiveErrors.length === 0 && criticPassed,
+              ok: res.directiveErrors.length === 0 && (critic?.passed ?? true),
               durationSec,
               vmdBytes: res.vmd.length,
+              finalVmdBytes: finalVmd.length,
+              rawKeyCount: (readVmdBoneKeys(res.vmd) ?? []).length,
+              finalKeyCount: keys.length,
               morphCount: res.morphCount,
               composed: res.composed,
               directiveErrors: res.directiveErrors,
               actionableWarnings,
               collisions: res.collisions,
-              critic: criticRaw,
-              criticAfterEnhance: criticEnhanced && !criticEnhanced.passed ? criticEnhanced : undefined,
+              critic,
+              criticRaw: criticRaw && !criticRaw.passed ? criticRaw : undefined,
+              groundContact: ground.ground,
+              groundBake: ground.bake,
+              groundNotes: ground.notes,
               audit: { violations: audit.violations, fixed: audit.fixed },
               keyframeCoords,
             },
@@ -525,7 +623,13 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
       throw new Error(`Cannot render: compiler produced 0 bytes. directiveErrors=${res.directiveErrors.join("; ")}`)
     }
 
-    const keys = readVmdBoneKeys(res.vmd) ?? []
+    // 画的是成品（增强 + 贴地烘焙后）：与舞台播放、kinematic critic 同源
+    const fin = finalizeMotion(auditVmd(res.vmd, bones).vmd, bones, {
+      mplSource: mpl,
+      enhanceOptions: { autoBlink: true },
+    })
+    const finalVmd = fin.vmd
+    const keys = readVmdBoneKeys(finalVmd) ?? []
     const maxFrame = keys.reduce((m, k) => Math.max(m, k.frame), 0)
     const durationSec = maxFrame / 30
     const mode = typeof args.mode === "string" ? args.mode : "auto"
@@ -533,29 +637,31 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
 
     if (useStoryboard) {
       const maxTiles = typeof args.maxTiles === "number" ? Math.max(2, Math.min(8, args.maxTiles)) : 6
-      const sb = renderStoryboardPng(bones, res.vmd, [{ index: 0, start: 0, end: durationSec, action: "preview", source: "llm" }], { maxTiles })
+      const sb = renderStoryboardPng(bones, finalVmd, [{ index: 0, start: 0, end: durationSec, action: "preview", source: "llm" }], { maxTiles })
       if (!sb) throw new Error("Failed to render storyboard PNG")
       const base64 = sb.dataUrl.replace(/^data:image\/png;base64,/, "")
       const tileCoords = extractKeyframeCoords(
         bones,
-        res.vmd,
+        finalVmd,
         sb.tiles.map((t) => t.timeSec)
       )
-      const allCoords = extractKeyframeCoords(bones, res.vmd)
-      const critic = critiquePoseVmd(bones, res.vmd, mpl, [{ index: 0, start: 0, end: durationSec }])
+      const allCoords = extractKeyframeCoords(bones, finalVmd)
+      const critic = critiquePoseVmd(bones, finalVmd, mpl, [{ index: 0, start: 0, end: durationSec }])
       const warnings = buildBiomechanicalWarnings(mpl, res.warnings, allCoords, bones)
       const tileSummary = tileCoords
         .map((c) => `t=${c.timeSec}s(footLiftL=${c.footLiftL}u,R=${c.footLiftR}u,hipDrop=${c.hipDrop}u,hipBack=${c.hipBackShift}u)`)
         .join("; ")
+      const ground = groundReport(fin)
       return {
         content: [
           { type: "image", data: base64, mimeType: "image/png" },
           {
             type: "text",
             text:
-              `Rendered ${sb.tiles.length}-tile storyboard (${sb.width}x${sb.height}, duration=${durationSec.toFixed(2)}s).\n` +
+              `Rendered ${sb.tiles.length}-tile storyboard (${sb.width}x${sb.height}, duration=${durationSec.toFixed(2)}s) of the FINAL motion (enhanced + ground-baked).\n` +
               `Tile telemetry: ${tileSummary}\n` +
-              `Kinematic critic: ${critic?.summary ?? "n/a"}` +
+              `Kinematic critic: ${critic?.summary ?? "n/a"}\n` +
+              `Ground contact: ${describeGroundEn(fin)}` +
               (warnings.length > 0 ? `\nWarnings:\n- ${warnings.join("\n- ")}` : ""),
           },
         ],
@@ -563,10 +669,10 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     }
 
     const targetFrame = typeof args.timeSec === "number" ? secondsToFrame(Math.max(0, args.timeSec)) : undefined
-    const single = renderPoseMultiViewPng(bones, res.vmd, targetFrame)
+    const single = renderPoseMultiViewPng(bones, finalVmd, targetFrame)
     if (!single) throw new Error("Failed to render multi-view PNG")
     const base64 = single.dataUrl.replace(/^data:image\/png;base64,/, "")
-    const [pt] = extractKeyframeCoords(bones, res.vmd, [single.timeSec])
+    const [pt] = extractKeyframeCoords(bones, finalVmd, [single.timeSec])
     const warnings = buildBiomechanicalWarnings(mpl, res.warnings, pt ? [pt] : [], bones)
     return {
       content: [
@@ -574,8 +680,9 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         {
           type: "text",
           text:
-            `Rendered 3-view PNG (Front/Side/Top, ${single.width}x${single.height}) at frame=${single.frame} (t=${single.timeSec.toFixed(2)}s). ` +
+            `Rendered 3-view PNG (Front/Side/Top, ${single.width}x${single.height}) of the FINAL motion at frame=${single.frame} (t=${single.timeSec.toFixed(2)}s). ` +
             (pt ? `footLiftL=${pt.footLiftL}u, footLiftR=${pt.footLiftR}u, hipDrop=${pt.hipDrop}u, hipBack=${pt.hipBackShift}u` : "") +
+            `\nGround contact: ${describeGroundEn(fin)}` +
             (warnings.length > 0 ? `\nWarnings:\n- ${warnings.join("\n- ")}` : ""),
         },
       ],
@@ -597,15 +704,39 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
 
     const exportMode = args.mode === "blocking" ? "blocking" : "final"
     const audit = auditVmd(res.vmd, bones)
-    const shouldEnhance = args.enhance !== undefined ? Boolean(args.enhance) : exportMode !== "blocking"
+    // final：增强 + 贴地烘焙（与舞台 playMplOnStage、compile_and_inspect_mpl2 同一条管线）。
+    // blocking：稀疏键原样导出给 Blender 精修 —— 永不增强、永不烘焙。
+    const fin = finalizeMotion(audit.vmd, bones, {
+      enhance: args.enhance !== undefined ? Boolean(args.enhance) : exportMode !== "blocking",
+      bake: exportMode !== "blocking",
+      mplSource: mpl,
+      enhanceOptions: { autoBlink: true },
+    })
+    const finalVmd = fin.vmd
+    // 闸门对象：final 看成品；blocking 看“这组稀疏键经标准贴地烘焙后”的预览。
+    // 过渡段帧间下沉是 Blender 那一步本来就要处理的事，不该拦下；作者姿势本身的错误照样拦。
+    // 这样 blocking 与 final / compile_and_inspect_mpl2 的结论一致。
+    const gate = exportMode === "blocking" ? finalizeMotion(audit.vmd, bones, { enhance: false, bake: true, mplSource: mpl }) : fin
+    const shouldEnhance = fin.enhanced
     const shouldPush = args.pushToStage !== undefined ? Boolean(args.pushToStage) : exportMode !== "blocking"
-    const finalVmd = shouldEnhance ? enhanceVmd(audit.vmd, { autoBlink: true }) : audit.vmd
     const keys = readVmdBoneKeys(finalVmd) ?? []
     const maxFrame = keys.reduce((m, k) => Math.max(m, k.frame), 0)
     const durationSec = Number((maxFrame / 30).toFixed(2))
-    const critic = critiquePoseVmd(bones, finalVmd, mpl, [{ index: 0, start: 0, end: durationSec }])
-    const coords = extractKeyframeCoords(bones, res.vmd)
+    const timeline = [{ index: 0, start: 0, end: durationSec }]
+    const critic = critiquePoseVmd(bones, gate.vmd, mpl, timeline)
+    const coords = extractKeyframeCoords(bones, finalVmd)
     const actionableWarnings = buildBiomechanicalWarnings(mpl, res.warnings, coords, bones)
+    const ground = groundReport(fin)
+    const gateReport = exportMode === "blocking" ? groundReport(gate) : null
+    const groundNotes = gateReport ? blockingGroundNotes(fin, gate) : ground.notes
+    const qualityGate = gateReport
+      ? {
+          checked: "ground-baked preview of the blocking keys (exported bytes stay un-baked)",
+          passed: critic?.passed ?? true,
+          groundContact: gateReport.ground,
+          groundBake: gateReport.bake,
+        }
+      : undefined
 
     if ((res.directiveErrors.length > 0 || (critic && !critic.passed)) && args.force !== true) {
       return {
@@ -618,7 +749,12 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
                 blockedByQualityGate: true,
                 directiveErrors: res.directiveErrors,
                 critic,
+                criticRaw: critiquePoseVmd(bones, res.vmd, mpl, timeline),
                 actionableWarnings,
+                groundContact: ground.ground,
+                groundBake: ground.bake,
+                groundNotes,
+                qualityGate,
                 message: "Export blocked by kinematic/directive quality gate. Fix the issues above and re-test, or pass force=true to override.",
               },
               null,
@@ -647,8 +783,13 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         const pushRes = await fetch(`${stageUrl}/api/stage-push`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          // 带 VMD 字节：舞台拿到 vmdBase64 就按字节播放，烘焙键不会在客户端重新编译/增强时丢失；
+          // mpl 只作编辑器标签。baseRotated/legsKeyed 取自 compileMPL2（与舞台 MPL 路径判定同源）。
           body: JSON.stringify({
             mpl,
+            vmdBase64: Buffer.from(finalVmd).toString("base64"),
+            baseRotated: Boolean(res.baseRotated),
+            legsKeyed: Boolean(res.legsKeyed),
             title: typeof args.title === "string" ? args.title : undefined,
           }),
         })
@@ -687,10 +828,16 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
               ok: true,
               mode: exportMode,
               vmdBytes: finalVmd.length,
+              vmdSha256: crypto.createHash("sha256").update(finalVmd).digest("hex"),
               enhanced: shouldEnhance,
+              baked: fin.baked,
               directiveErrors: res.directiveErrors,
               actionableWarnings,
               criticSummary: critic?.summary,
+              groundContact: ground.ground,
+              groundBake: ground.bake,
+              groundNotes,
+              qualityGate,
               writtenFiles,
               blenderHandoff,
               stagePush: stagePushResult,
@@ -728,6 +875,33 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     }
 
     const content: Array<Record<string, unknown>> = []
+    // 外部文件按字节原样评判（舞台上也是原样播放）。若它尚未烘焙（blocking 导出属预期），
+    // 附一份“标准贴地烘焙后会怎样”的预览：区分“帧间偏差，烘焙可修”与“作者关键帧本身的问题”。
+    const groundContact = groundSummaryOf(bones, vmdBytes)
+    const groundNotes: string[] = []
+    let groundBakePreview: Record<string, unknown> | null = null
+    if (groundContact && groundContact.offendingFrames > 0) {
+      const sink = Math.min(0, groundContact.feet.l.min, groundContact.feet.r.min)
+      groundNotes.push(
+        `${groundContact.offendingFrames} foot-frame(s) deviate from the floor when this file is played as-is (deepest sink ${sink.toFixed(3)}u)`
+      )
+      const preview = finalizeMotion(vmdBytes, bones, { enhance: false, bake: true })
+      const bs = preview.bakeStats
+      const after = preview.ground
+      groundBakePreview = {
+        applied: preview.baked,
+        insertedKeys: bs?.insertedKeys ?? 0,
+        residualFrames: bs?.residualFrames ?? 0,
+        residualAtEntries: bs?.residualAtEntries ?? 0,
+        windows: bs?.windows ?? [],
+        after,
+      }
+      groundNotes.push(
+        after && after.offendingFrames === 0
+          ? `the standard ground bake fixes all of them (+${bs?.insertedKeys ?? 0} keys) — expected for an un-baked mode="blocking" export; re-inspect after Blender / ground polish before pushing`
+          : `${after?.offendingFrames ?? "?"} foot-frame(s) would remain after the standard ground bake (${bs?.residualAtEntries ?? "?"} on authored key poses) — fix those key poses`
+      )
+    }
     if (args.renderViews === true) {
       if (durationSec >= 1.5) {
         const sb = renderStoryboardPng(bones, vmdBytes, [{ index: 0, start: 0, end: durationSec, action: "vmd", source: "llm" }], { maxTiles: 6 })
@@ -753,6 +927,9 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
           durationSec,
           critic,
           audit: { violations: audit.violations },
+          groundContact,
+          groundBakePreview,
+          groundNotes,
           telemetryWarnings,
           keyframeCoords,
         },
@@ -786,6 +963,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
                 ok: false,
                 blockedByQualityGate: true,
                 critic,
+                groundContact: groundSummaryOf(bones, vmdBytes),
                 message: "Push blocked by kinematic quality gate. Fix in Blender or pass force=true to override.",
               },
               null,
@@ -838,6 +1016,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
               baseRotated,
               legsKeyed,
               criticSummary: critic?.summary,
+              groundContact: groundSummaryOf(bones, vmdBytes),
               stagePush: stagePushResult,
             },
             null,
