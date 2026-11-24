@@ -12,12 +12,16 @@
  *   - inspect_vmd_file
  *   - push_vmd_to_stage
  *   - inspect_duo            (two-actor world transform, collision/distance check & duo render)
+ *   - get_blender_scene_info (inspect running Blender scene via blender_mcp.py socket bridge)
+ *   - execute_blender_code   (run bpy / mmd_tools Python inside connected local Blender GUI)
+ *   - get_blender_viewport   (capture offscreen 3D viewport PNG from connected Blender)
  *
  * IMPORTANT: stdout is strictly reserved for JSON-RPC 2.0 frames. All diagnostic
  * logs are redirected to stderr.
  */
 
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
 import readline from "node:readline"
@@ -51,6 +55,7 @@ import {
   worldToActorLocal,
   type DuoPlacement,
 } from "../lib/duo.ts"
+import { resolveBlenderEndpoint, sendBlenderCommand } from "../lib/blender-bridge.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = process.env.POPO_ROOT?.trim()
@@ -824,6 +829,51 @@ const TOOLS = [
         },
       },
       required: ["actorA", "actorB"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_blender_scene_info",
+    description:
+      "Read-only check of the connected local Blender GUI via the blender_mcp.py addon socket (default 127.0.0.1:9876): returns scene name, object count, first objects, materials count, and optional addon/version handshake.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeAddonInfo: { type: "boolean", description: "Also query get_addon_info (Blender version & capabilities, default true)" },
+        host: { type: "string", description: "Blender MCP socket host (default: BLENDER_HOST or 127.0.0.1)" },
+        port: { type: "number", description: "Blender MCP socket port (default: BLENDER_PORT or 9876)" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "execute_blender_code",
+    description:
+      "Execute arbitrary Blender Python (bpy / mmd_tools) inside the user's running local Blender GUI via the blender_mcp.py addon socket (default 127.0.0.1:9876). Use this for Stage 2 mmd_tools import, F-Curve smoothing, sole-to-floor cleanup, dual-rig placement, and VMD export; only call when the user wants Blender updated.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Python code to execute in Blender's bpy context (stdout is captured and returned)" },
+        timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 120000)" },
+        host: { type: "string", description: "Blender MCP socket host (default: BLENDER_HOST or 127.0.0.1)" },
+        port: { type: "number", description: "Blender MCP socket port (default: BLENDER_PORT or 9876)" },
+      },
+      required: ["code"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_blender_viewport",
+    description:
+      "Capture an offscreen screenshot of the active 3D Viewport from the connected local Blender GUI (via blender_mcp.py) and return it as an inline PNG image for visual mesh/skirt/hand inspection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxSize: { type: "number", description: "Maximum dimension in pixels (default: 800)" },
+        filepath: { type: "string", description: "Optional path to keep the captured PNG; if omitted a temp file is used and removed after reading" },
+        host: { type: "string", description: "Blender MCP socket host (default: BLENDER_HOST or 127.0.0.1)" },
+        port: { type: "number", description: "Blender MCP socket port (default: BLENDER_PORT or 9876)" },
+      },
       additionalProperties: false,
     },
   },
@@ -1697,6 +1747,95 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
 
     content.push({ type: "text", text: stringifyReport(report) })
     return { content }
+  }
+
+  if (name === "get_blender_scene_info") {
+    const cfg = {
+      host: typeof args.host === "string" ? args.host : undefined,
+      port: typeof args.port === "number" ? args.port : undefined,
+      timeoutMs: 15_000,
+    }
+    const endpoint = resolveBlenderEndpoint(cfg)
+    const sceneInfo = await sendBlenderCommand("get_scene_info", {}, cfg)
+    const addonInfo = args.includeAddonInfo === false
+      ? undefined
+      : await sendBlenderCommand("get_addon_info", {}, cfg).catch(() => undefined)
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ok: true, endpoint, addonInfo, sceneInfo }, null, 2),
+        },
+      ],
+    }
+  }
+
+  if (name === "execute_blender_code") {
+    const code = typeof args.code === "string" ? args.code : ""
+    if (!code.trim()) throw new Error("code is required")
+    const cfg = {
+      host: typeof args.host === "string" ? args.host : undefined,
+      port: typeof args.port === "number" ? args.port : undefined,
+      timeoutMs: typeof args.timeoutMs === "number" && args.timeoutMs > 0 ? args.timeoutMs : 120_000,
+    }
+    const endpoint = resolveBlenderEndpoint(cfg)
+    const res = await sendBlenderCommand("execute_code", { code }, cfg)
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ok: true, endpoint, ...(typeof res === "object" && res ? res : { result: res }) }, null, 2),
+        },
+      ],
+    }
+  }
+
+  if (name === "get_blender_viewport") {
+    const cfg = {
+      host: typeof args.host === "string" ? args.host : undefined,
+      port: typeof args.port === "number" ? args.port : undefined,
+      timeoutMs: 30_000,
+    }
+    const maxSize = typeof args.maxSize === "number" && args.maxSize > 0 ? args.maxSize : 800
+    const userPath = typeof args.filepath === "string" && args.filepath.trim() ? args.filepath.trim() : ""
+    const absPath = userPath
+      ? path.resolve(ROOT_DIR, userPath)
+      : path.join(os.tmpdir(), `popo-blender-vp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`)
+    fs.mkdirSync(path.dirname(absPath), { recursive: true })
+
+    try {
+      const vpRes = await sendBlenderCommand<Record<string, unknown>>(
+        "get_viewport_screenshot",
+        { max_size: maxSize, filepath: absPath, format: "png" },
+        cfg
+      )
+      if (!fs.existsSync(absPath)) {
+        throw new Error(`Blender viewport screenshot did not create file: ${absPath} (${JSON.stringify(vpRes)})`)
+      }
+      const pngBytes = fs.readFileSync(absPath)
+      const content: Array<Record<string, unknown>> = [
+        { type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" },
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              endpoint: resolveBlenderEndpoint(cfg),
+              filepath: userPath ? absPath : "(ephemeral)",
+              bytes: pngBytes.length,
+              viewport: vpRes,
+            },
+            null,
+            2
+          ),
+        },
+      ]
+      return { content }
+    } finally {
+      if (!userPath && fs.existsSync(absPath)) {
+        fs.unlinkSync(absPath)
+      }
+    }
   }
 
   throw new Error(`Unknown tool: ${name}`)

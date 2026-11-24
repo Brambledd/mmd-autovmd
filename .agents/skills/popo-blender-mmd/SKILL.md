@@ -9,7 +9,7 @@ description: >-
 
 # PoPo + Blender MMD Motion Workflow
 
-Use this skill whenever creating or refining 3D character motions for `.pmx` models across **PoPo MCP (`popo-mmd`)** and **Blender (`mmd_tools`)**. In Antigravity, call the registered `popo-mmd` MCP tools directly (no `mcp__` prefix needed); in DSH they are named `mcp__popo-mmd__<tool>` and `mcp__blender__execute_blender_code`. For Stage 2 (Blender), use either a connected `blender` MCP server OR run `bpy` scripts directly via `blender -b --python <script.py>` (or open the `.blend` in Blender GUI to inspect).
+Use this skill whenever creating or refining 3D character motions for `.pmx` models across **PoPo MCP (`popo-mmd`)** and **Blender (`mmd_tools`)**. `popo-mmd` directly includes `get_blender_scene_info`, `execute_blender_code`, and `get_blender_viewport` (bridging to Blender's `blender_mcp.py` addon socket on `127.0.0.1:9876`, configurable via `BLENDER_HOST` / `BLENDER_PORT`), so Antigravity can drive Blender GUI natively with zero extra MCP servers; in DSH they may also appear under `mcp__popo-mmd__<tool>` / `mcp__blender__execute_blender_code`. As an offline fallback, you can also run `bpy` scripts via `blender -b --python <script.py>`.
 
 ## Division of Responsibilities (Single Source of Truth)
 
@@ -54,7 +54,7 @@ Use this skill whenever creating or refining 3D character motions for `.pmx` mod
 
 ## Stage 2 — Blender `mmd_tools` Last-Mile Polish
 
-When interacting with Blender — either via a Blender MCP tool (`execute_blender_code`) against a running Blender GUI, or by writing a Python script in `.tmp/` and invoking `blender --background --python <script.py>` — **strictly follow these `mmd_tools` v4.2+ conventions**:
+When interacting with Blender — via `popo-mmd`'s `execute_blender_code` / `get_blender_scene_info` / `get_blender_viewport` tools against a running Blender GUI with the `MCP for Blender` (`blender_mcp.py`) addon enabled (3D Viewport Sidebar `N` → `MCP for Blender` → Connect/Start), or via `blender --background --python <script.py>` — **strictly follow these `mmd_tools` v4.2+ conventions**:
 
 ### 1. Import `.pmx` and Blocking `.vmd` (No 5-frame Margin!)
 
