@@ -735,11 +735,19 @@ export function bakeGroundContact(
         }
 
         // 2) 重心 y 平移：抵消脚相对“目标误差曲线”的公共偏差（双脚都在时取均值）
-        const errs = active.map(({ side, w }) => contactError(rigs[side], tf, w.flat) - intendedError(w, f))
-        const needFix = errs.some((e) => Math.abs(e) > tolerance)
+        const intended = active.map(({ w }) => intendedError(w, f))
+        const errs = active.map(({ side, w }, i) => contactError(rigs[side], tf, w.flat) - intended[i])
+        const needFix = intended.some((line, i) => {
+          const relBad = Math.abs(errs[i]) > tolerance
+          // 作者线在容差带内：按绝对误差判——脚底必须真的落回静止高度带内，
+          // 否则增强器插的小过冲等会让帧间浮起被“相对判据”放过而上报成残留；
+          // 作者线自身超差（坐姿等）：只要求不比作者线更差。
+          const absBad = Math.abs(line) <= tolerance && Math.abs(errs[i] + line) > tolerance
+          return relBad || absBad
+        })
         if (!needFix && Object.keys(pitched).length === 0) continue
         const dy = errs.length > 0 ? -mean(errs) : 0
-        if (!hasKeyAt(tracks.get(CENTER_JP), f) && Math.abs(dy) > tolerance * 0.5) {
+        if (!hasKeyAt(tracks.get(CENTER_JP), f) && Math.abs(dy) > tolerance * 0.1) {
           const start = Math.min(...active.map((a) => a.w.start))
           const end = Math.max(...active.map((a) => a.w.end))
           const track = ensureAnchors(CENTER_JP, start, end)

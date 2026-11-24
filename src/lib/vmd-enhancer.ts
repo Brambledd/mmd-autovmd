@@ -128,8 +128,8 @@ const LEG_CHAIN = new Set(["左足", "右足", "左ひざ", "右ひざ", "左足
 const LEG_IK_BONES = new Set(["右足IK親", "左足IK親", "右足ＩＫ", "左足ＩＫ", "右つま先ＩＫ", "左つま先ＩＫ"])
 /** Pelvis/root + leg chain stay temporally synchronized so knee bend matches center drop (no mid-squat ground clipping). */
 const GROUND_SYNC_BONES = new Set(["全ての親", "センター", "グルーブ", "腰", "下半身", ...LEG_CHAIN])
-/** Floor-anchored root bones and ground-coupled leg chain must not independently overshoot/anticipate without center Y tracking (prevents mid-air foot popping). */
-const NO_EMBELLISH_BONES = new Set(["全ての親", "センター", ...LEG_CHAIN])
+/** Floor-anchored root bones and ground-coupled leg chain must not independently overshoot/anticipate without center Y tracking (prevents mid-air foot popping). Includes every conventional leg ancestor (グルーブ / 腰 / 下半身 sit between センター and the legs on semi-standard rigs): a 3° overshoot key on 腰 alone lifts both feet ~3mm. */
+const NO_EMBELLISH_BONES = new Set(["全ての親", "センター", "グルーブ", "腰", "下半身", ...LEG_CHAIN])
 
 // ---------------------------------------------------------------- quaternion
 
