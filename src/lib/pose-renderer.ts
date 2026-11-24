@@ -8,8 +8,9 @@
  */
 
 import { deflateSync } from "node:zlib"
-import { buildBoneTracks, qRotate, readVmdBoneKeys, sampleBoneTracks, solveFrameTransforms } from "./fk.ts"
-import type { BoneTracks, Quat, Vec3, VmdBoneKey } from "./fk.ts"
+import { buildBoneTracks, qMul, qRotate, readVmdBoneKeys, sampleBoneTracks, solveFrameTransforms } from "./fk.ts"
+import type { BoneTracks, FrameTransforms, Quat, Vec3, VmdBoneKey } from "./fk.ts"
+import { duoYawQuat, type DuoPlacement } from "./duo.ts"
 import { detectPosSemantics, measureModelGeometry } from "./model-geometry.ts"
 import type { PmxBones } from "./pmx-bones.ts"
 
@@ -506,56 +507,104 @@ const ANCHOR_LANDMARKS = [
 /** 每个场景上下文的骨骼轨道（按帧排序），供分镜各格做引擎同源插值采样。 */
 const ctxTracks = new WeakMap<SceneContext, BoneTracks>()
 
-function renderFramePanels(
+interface ActorPalette {
+  headFill: RGBA
+  spine: RGBA
+  legL: RGBA
+  legR: RGBA
+  armL: RGBA
+  armR: RGBA
+  fingerL: RGBA
+  fingerR: RGBA
+}
+
+const DEFAULT_PALETTE: ActorPalette = {
+  headFill: [254, 226, 226, 175],
+  spine: [51, 65, 85, 240],
+  legL: [30, 64, 175, 245],
+  legR: [153, 27, 27, 245],
+  armL: [37, 99, 235, 250],
+  armR: [220, 38, 38, 250],
+  fingerL: [6, 182, 212, 245],
+  fingerR: [249, 115, 22, 245],
+}
+
+const PARTNER_PALETTE: ActorPalette = {
+  headFill: [219, 234, 254, 180],
+  spine: [71, 85, 105, 240],
+  legL: [13, 148, 136, 245],
+  legR: [180, 83, 9, 245],
+  armL: [20, 184, 166, 250],
+  armR: [217, 119, 6, 250],
+  fingerL: [45, 212, 191, 245],
+  fingerR: [251, 191, 36, 245],
+}
+
+interface ActorRenderSlot {
+  ctx: SceneContext
+  placement?: DuoPlacement
+  tag?: string
+  palette?: ActorPalette
+}
+
+function solveSlotWorldTransforms(slot: ActorRenderSlot, frame: number): FrameTransforms | null {
+  let tracks = ctxTracks.get(slot.ctx)
+  if (!tracks) {
+    tracks = buildBoneTracks(slot.ctx.keys)
+    ctxTracks.set(slot.ctx, tracks)
+  }
+  const tf = solveFrameTransforms(slot.ctx.bones, sampleBoneTracks(tracks, frame), slot.ctx.semantics)
+  if (!tf) return null
+  if (!slot.placement) return tf
+  const qYaw = duoYawQuat(slot.placement.yawDeg)
+  const [ox, oy, oz] = slot.placement.offset
+  return {
+    pos: tf.pos.map((p) => {
+      const r = qRotate(qYaw, p)
+      return { x: r.x + ox, y: r.y + oy, z: r.z + oz }
+    }),
+    quat: tf.quat.map((q) => qMul(qYaw, q)),
+  }
+}
+
+function renderMultiActorFramePanels(
   canvas: RasterCanvas,
-  ctx: SceneContext,
+  slots: ActorRenderSlot[],
   frame: number,
   x0: number,
   y0: number,
   panelH: number,
   views: Array<{ kind: ViewKind; label: string; width: number }>
 ): boolean {
-  // 与舞台引擎同源的插值采样（此前用 step-hold 取 ≤frame 的最近键，
-  // 画出来的是“最近关键帧”而不是这一帧，和连续 critic 的结论对不上）
-  let tracks = ctxTracks.get(ctx)
-  if (!tracks) {
-    tracks = buildBoneTracks(ctx.keys)
-    ctxTracks.set(ctx, tracks)
-  }
-  const tf = solveFrameTransforms(ctx.bones, sampleBoneTracks(tracks, frame), ctx.semantics)
-  if (!tf) return false
-
-  const posOf = (jp: string): Vec3 | undefined => {
-    const idx = ctx.bones.indexByJp.get(jp)
-    return idx != null ? tf.pos[idx] : undefined
-  }
-  const quatOf = (jp: string): Quat | undefined => {
-    const idx = ctx.bones.indexByJp.get(jp)
-    return idx != null ? tf.quat[idx] : undefined
-  }
+  const solved = slots.map((slot) => ({
+    slot,
+    tf: solveSlotWorldTransforms(slot, frame),
+    palette: slot.palette ?? DEFAULT_PALETTE,
+  }))
+  if (solved.some((s) => !s.tf)) return false
 
   let minY = 0
-  let maxY = ctx.heightUnits + 1.5
+  let maxY = Math.max(...slots.map((s) => s.ctx.heightUnits + 1.5))
   let centerX = 0
   let centerZ = 0
   let cnt = 0
-  for (const n of ANCHOR_LANDMARKS) {
-    const p = posOf(n)
-    if (!p) continue
-    minY = Math.min(minY, p.y - 1.5)
-    maxY = Math.max(maxY, p.y + (n === "頭" ? ctx.headRadius * 1.9 : 1.0))
-    centerX += p.x
-    centerZ += p.z
-    cnt++
+  for (const { slot, tf } of solved) {
+    for (const n of ANCHOR_LANDMARKS) {
+      const idx = slot.ctx.bones.indexByJp.get(n)
+      const p = idx != null ? tf!.pos[idx] : undefined
+      if (!p) continue
+      minY = Math.min(minY, p.y - 1.5)
+      maxY = Math.max(maxY, p.y + (n === "頭" ? slot.ctx.headRadius * 1.9 : 1.0))
+      centerX += p.x
+      centerZ += p.z
+      cnt++
+    }
   }
   if (cnt > 0) {
     centerX /= cnt
     centerZ /= cnt
   }
   const spanY = Math.max(12, maxY - minY)
-  const scale = Math.min(12.2, (panelH - 56) / spanY)
-  const groundPy = Math.round(y0 + panelH - 22 + Math.min(0, minY) * scale)
-  const hasDLegs = Boolean(posOf("左足D") && posOf("右足D"))
 
   let curX = x0
   for (let vi = 0; vi < views.length; vi++) {
@@ -565,6 +614,28 @@ function renderFramePanels(
     const clip: [number, number, number, number] = [vx0 + 2, y0 + 2, vx0 + vw.width - 3, y0 + panelH - 2]
     const cx = vx0 + vw.width / 2
     const refCenter = projectPoint({ x: centerX, y: 0, z: centerZ }, vw.kind)
+
+    let minU = -4
+    let maxU = 4
+    if (solved.length > 1) {
+      for (const { slot, tf } of solved) {
+        for (const n of ANCHOR_LANDMARKS) {
+          const idx = slot.ctx.bones.indexByJp.get(n)
+          const p = idx != null ? tf!.pos[idx] : undefined
+          if (!p) continue
+          const du = projectPoint(p, vw.kind).u - refCenter.u
+          minU = Math.min(minU, du - 2.2)
+          maxU = Math.max(maxU, du + 2.2)
+        }
+      }
+    }
+    const spanU = Math.max(10, maxU - minU)
+    const scale = Math.min(
+      12.2,
+      (panelH - 56) / spanY,
+      solved.length > 1 ? (vw.width - 20) / spanU : 12.2
+    )
+    const groundPy = Math.round(y0 + panelH - 22 + Math.min(0, minY) * scale)
     const toScreen = (p: Vec3) => {
       const pr = projectPoint(p, vw.kind)
       return {
@@ -585,110 +656,132 @@ function renderFramePanels(
 
     const cmds: DrawCmd[] = []
 
-    const pLower = posOf("下半身") ?? posOf("腰")
-    const pUpper = posOf("上半身")
-    const pUpper2 = posOf("上半身2") ?? pUpper
-    const pNeck = posOf("首")
-    if (pLower && pUpper) {
-      const a = toScreen(pLower)
-      const b = toScreen(pUpper)
-      cmds.push({
-        depth: (a.depth + b.depth) / 2 - 0.4,
-        draw: () => canvas.fillCapsule(a.x, a.y, b.x, b.y, ctx.hipRadius * scale * 0.78, [203, 213, 225, 130], clip),
-      })
-    }
-    if (pUpper && pNeck) {
-      const a = toScreen(pUpper)
-      const b = toScreen(pUpper2 ?? pNeck)
-      const c = toScreen(pNeck)
-      cmds.push({
-        depth: (a.depth + c.depth) / 2 - 0.3,
-        draw: () => {
-          canvas.fillCapsule(a.x, a.y, b.x, b.y, ctx.torsoRadius * scale * 0.85, [226, 232, 240, 145], clip)
-          canvas.fillCapsule(b.x, b.y, c.x, c.y, ctx.torsoRadius * scale * 0.75, [226, 232, 240, 145], clip)
-        },
-      })
-    }
+    for (const { slot, tf, palette } of solved) {
+      const ctx = slot.ctx
+      const posOf = (jp: string): Vec3 | undefined => {
+        const idx = ctx.bones.indexByJp.get(jp)
+        return idx != null ? tf!.pos[idx] : undefined
+      }
+      const quatOf = (jp: string): Quat | undefined => {
+        const idx = ctx.bones.indexByJp.get(jp)
+        return idx != null ? tf!.quat[idx] : undefined
+      }
+      const hasDLegs = Boolean(posOf("左足D") && posOf("右足D"))
 
-    const pHead = posOf("頭")
-    const qHead = quatOf("頭")
-    if (pHead && qHead) {
-      const headCenter = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.72, z: 0 }))
-      const sHead = toScreen(headCenter)
-      const rPx = ctx.headRadius * scale
-      cmds.push({
-        depth: sHead.depth - 0.1,
-        draw: () => {
-          canvas.fillCircle(sHead.x, sHead.y, rPx, [254, 226, 226, 175], clip)
-          canvas.strokeCircle(sHead.x, sHead.y, rPx, [148, 163, 184, 220], clip)
-        },
-      })
-      const eyeL = addVec(pHead, qRotate(qHead, { x: 0.42, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.86 }))
-      const eyeR = addVec(pHead, qRotate(qHead, { x: -0.42, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.86 }))
-      const eyeMid = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.92 }))
-      const gazeTip = addVec(eyeMid, qRotate(qHead, { x: 0, y: 0, z: -3.6 }))
-      const mouthPt = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.24, z: -ctx.headRadius * 0.94 }))
-      const sEyeL = toScreen(eyeL)
-      const sEyeR = toScreen(eyeR)
-      const sEyeMid = toScreen(eyeMid)
-      const sGazeTip = toScreen(gazeTip)
-      const sMouth = toScreen(mouthPt)
-      cmds.push({
-        depth: sEyeMid.depth + 0.2,
-        draw: () => {
-          canvas.fillCircle(sEyeL.x, sEyeL.y, 2.3, [15, 23, 42, 240], clip)
-          canvas.fillCircle(sEyeR.x, sEyeR.y, 2.3, [15, 23, 42, 240], clip)
-          canvas.fillCircle(sMouth.x, sMouth.y, 2.5, [219, 39, 119, 240], clip)
-          canvas.line(sEyeMid.x, sEyeMid.y, sGazeTip.x, sGazeTip.y, [22, 163, 74, 245], 2.2, clip)
-          canvas.fillCircle(sGazeTip.x, sGazeTip.y, 2.8, [22, 163, 74, 255], clip)
-        },
-      })
-    }
-
-    const pushChain = (names: string[], col: RGBA, width: number, jointRadius = 2.8) => {
-      for (let i = 1; i < names.length; i++) {
-        const a3 = posOf(names[i - 1])
-        const b3 = posOf(names[i])
-        if (!a3 || !b3) continue
-        const a = toScreen(a3)
-        const b = toScreen(b3)
+      const pLower = posOf("下半身") ?? posOf("腰")
+      const pUpper = posOf("上半身")
+      const pUpper2 = posOf("上半身2") ?? pUpper
+      const pNeck = posOf("首")
+      if (pLower && pUpper) {
+        const a = toScreen(pLower)
+        const b = toScreen(pUpper)
         cmds.push({
-          depth: (a.depth + b.depth) / 2,
+          depth: (a.depth + b.depth) / 2 - 0.4,
+          draw: () => canvas.fillCapsule(a.x, a.y, b.x, b.y, ctx.hipRadius * scale * 0.78, [203, 213, 225, 130], clip),
+        })
+      }
+      if (pUpper && pNeck) {
+        const a = toScreen(pUpper)
+        const b = toScreen(pUpper2 ?? pNeck)
+        const c = toScreen(pNeck)
+        cmds.push({
+          depth: (a.depth + c.depth) / 2 - 0.3,
           draw: () => {
-            canvas.line(a.x, a.y, b.x, b.y, col, width, clip)
-            canvas.fillCircle(b.x, b.y, jointRadius, col, clip)
+            canvas.fillCapsule(a.x, a.y, b.x, b.y, ctx.torsoRadius * scale * 0.85, [226, 232, 240, 145], clip)
+            canvas.fillCapsule(b.x, b.y, c.x, c.y, ctx.torsoRadius * scale * 0.75, [226, 232, 240, 145], clip)
           },
         })
       }
-    }
 
-    pushChain(["下半身", "腰", "上半身", "上半身2", "首", "頭"], [51, 65, 85, 240], 3.5, 3.0)
-    if (hasDLegs) {
-      pushChain(["下半身", "左足D", "左ひざD", "左足首D", "左足先EX"], [30, 64, 175, 245], 4.0, 3.2)
-      pushChain(["下半身", "右足D", "右ひざD", "右足首D", "右足先EX"], [153, 27, 27, 245], 4.0, 3.2)
-    } else {
-      pushChain(["下半身", "左足", "左ひざ", "左足首", "左足先EX"], [30, 64, 175, 245], 4.0, 3.2)
-      pushChain(["下半身", "右足", "右ひざ", "右足首", "右足先EX"], [153, 27, 27, 245], 4.0, 3.2)
-    }
-    pushChain(["上半身2", "左肩", "左腕", "左ひじ", "左手首"], [37, 99, 235, 250], 3.8, 3.6)
-    pushChain(["上半身2", "右肩", "右腕", "右ひじ", "右手首"], [220, 38, 38, 250], 3.8, 3.6)
-
-    for (const side of ["左", "右"] as const) {
-      const wrist = posOf(`${side}手首`)
-      if (!wrist) continue
-      const col: RGBA = side === "左" ? [6, 182, 212, 245] : [249, 115, 22, 245]
-      for (const fName of ["親指", "人指", "中指", "薬指", "小指"]) {
-        const p1 = posOf(`${side}${fName}１`) ?? posOf(`${side}${fName}０`)
-        const p2 = posOf(`${side}${fName}２`)
-        const p3 = posOf(`${side}${fName}３`) ?? p2
-        const pts = [wrist, p1, p2, p3].filter((x): x is Vec3 => Boolean(x))
-        for (let i = 1; i < pts.length; i++) {
-          const a = toScreen(pts[i - 1])
-          const b = toScreen(pts[i])
+      const pHead = posOf("頭")
+      const qHead = quatOf("頭")
+      if (pHead && qHead) {
+        const headCenter = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.72, z: 0 }))
+        const sHead = toScreen(headCenter)
+        const rPx = ctx.headRadius * scale
+        cmds.push({
+          depth: sHead.depth - 0.1,
+          draw: () => {
+            canvas.fillCircle(sHead.x, sHead.y, rPx, palette.headFill, clip)
+            canvas.strokeCircle(sHead.x, sHead.y, rPx, [148, 163, 184, 220], clip)
+          },
+        })
+        if (slot.tag) {
           cmds.push({
-            depth: (a.depth + b.depth) / 2 + 0.15,
-            draw: () => canvas.line(a.x, a.y, b.x, b.y, col, 1.5, clip),
+            depth: sHead.depth + 0.35,
+            draw: () => {
+              canvas.fillRect(sHead.x - 5, sHead.y - rPx - 12, 11, 10, [15, 23, 42, 215])
+              canvas.drawText(sHead.x - 2, sHead.y - rPx - 10, slot.tag!, [248, 250, 252, 255], 1)
+            },
           })
+        }
+        const eyeL = addVec(pHead, qRotate(qHead, { x: 0.42, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.86 }))
+        const eyeR = addVec(pHead, qRotate(qHead, { x: -0.42, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.86 }))
+        const eyeMid = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.65, z: -ctx.headRadius * 0.92 }))
+        const gazeTip = addVec(eyeMid, qRotate(qHead, { x: 0, y: 0, z: -3.6 }))
+        const mouthPt = addVec(pHead, qRotate(qHead, { x: 0, y: ctx.headRadius * 0.24, z: -ctx.headRadius * 0.94 }))
+        const sEyeL = toScreen(eyeL)
+        const sEyeR = toScreen(eyeR)
+        const sEyeMid = toScreen(eyeMid)
+        const sGazeTip = toScreen(gazeTip)
+        const sMouth = toScreen(mouthPt)
+        cmds.push({
+          depth: sEyeMid.depth + 0.2,
+          draw: () => {
+            canvas.fillCircle(sEyeL.x, sEyeL.y, 2.3, [15, 23, 42, 240], clip)
+            canvas.fillCircle(sEyeR.x, sEyeR.y, 2.3, [15, 23, 42, 240], clip)
+            canvas.fillCircle(sMouth.x, sMouth.y, 2.5, [219, 39, 119, 240], clip)
+            canvas.line(sEyeMid.x, sEyeMid.y, sGazeTip.x, sGazeTip.y, [22, 163, 74, 245], 2.2, clip)
+            canvas.fillCircle(sGazeTip.x, sGazeTip.y, 2.8, [22, 163, 74, 255], clip)
+          },
+        })
+      }
+
+      const pushChain = (names: string[], col: RGBA, width: number, jointRadius = 2.8) => {
+        for (let i = 1; i < names.length; i++) {
+          const a3 = posOf(names[i - 1])
+          const b3 = posOf(names[i])
+          if (!a3 || !b3) continue
+          const a = toScreen(a3)
+          const b = toScreen(b3)
+          cmds.push({
+            depth: (a.depth + b.depth) / 2,
+            draw: () => {
+              canvas.line(a.x, a.y, b.x, b.y, col, width, clip)
+              canvas.fillCircle(b.x, b.y, jointRadius, col, clip)
+            },
+          })
+        }
+      }
+
+      pushChain(["下半身", "腰", "上半身", "上半身2", "首", "頭"], palette.spine, 3.5, 3.0)
+      if (hasDLegs) {
+        pushChain(["下半身", "左足D", "左ひざD", "左足首D", "左足先EX"], palette.legL, 4.0, 3.2)
+        pushChain(["下半身", "右足D", "右ひざD", "右足首D", "右足先EX"], palette.legR, 4.0, 3.2)
+      } else {
+        pushChain(["下半身", "左足", "左ひざ", "左足首", "左足先EX"], palette.legL, 4.0, 3.2)
+        pushChain(["下半身", "右足", "右ひざ", "右足首", "右足先EX"], palette.legR, 4.0, 3.2)
+      }
+      pushChain(["上半身2", "左肩", "左腕", "左ひじ", "左手首"], palette.armL, 3.8, 3.6)
+      pushChain(["上半身2", "右肩", "右腕", "右ひじ", "右手首"], palette.armR, 3.8, 3.6)
+
+      for (const side of ["左", "右"] as const) {
+        const wrist = posOf(`${side}手首`)
+        if (!wrist) continue
+        const col: RGBA = side === "左" ? palette.fingerL : palette.fingerR
+        for (const fName of ["親指", "人指", "中指", "薬指", "小指"]) {
+          const p1 = posOf(`${side}${fName}１`) ?? posOf(`${side}${fName}０`)
+          const p2 = posOf(`${side}${fName}２`)
+          const p3 = posOf(`${side}${fName}３`) ?? p2
+          const pts = [wrist, p1, p2, p3].filter((x): x is Vec3 => Boolean(x))
+          for (let i = 1; i < pts.length; i++) {
+            const a = toScreen(pts[i - 1])
+            const b = toScreen(pts[i])
+            cmds.push({
+              depth: (a.depth + b.depth) / 2 + 0.15,
+              draw: () => canvas.line(a.x, a.y, b.x, b.y, col, 1.5, clip),
+            })
+          }
         }
       }
     }
@@ -703,6 +796,18 @@ function renderFramePanels(
     }
   }
   return true
+}
+
+function renderFramePanels(
+  canvas: RasterCanvas,
+  ctx: SceneContext,
+  frame: number,
+  x0: number,
+  y0: number,
+  panelH: number,
+  views: Array<{ kind: ViewKind; label: string; width: number }>
+): boolean {
+  return renderMultiActorFramePanels(canvas, [{ ctx }], frame, x0, y0, panelH, views)
 }
 
 function buildSceneContext(bones: PmxBones, vmd: Uint8Array): SceneContext | null {
@@ -829,6 +934,172 @@ export function renderStoryboardPng(
       14,
       rows * tileH + 13,
       `STORYBOARD ${tiles.length} FRAMES: LEFT=FRONT RIGHT=3/4  R-ARM=RED L-ARM=BLUE GAZE=GREEN FLOOR=Y0`,
+      [226, 232, 240, 255],
+      1
+    )
+
+    const png = encodePng(W, H, canvas.px)
+    const base64 = Buffer.from(png).toString("base64")
+    return {
+      png,
+      base64,
+      dataUrl: `data:image/png;base64,${base64}`,
+      tiles,
+      width: W,
+      height: H,
+    }
+  } catch {
+    return null
+  }
+}
+
+export interface DuoRenderActor {
+  bones: PmxBones
+  vmd: Uint8Array
+  placement: DuoPlacement
+  tag?: string
+}
+
+/**
+ * 渲染双人同框单帧三视图 PNG（840×360）。
+ */
+export function renderDuoMultiViewPng(
+  actorA: DuoRenderActor,
+  actorB: DuoRenderActor,
+  targetFrame?: number
+): RenderedPosePng | null {
+  try {
+    const ctxA = buildSceneContext(actorA.bones, actorA.vmd)
+    const ctxB = buildSceneContext(actorB.bones, actorB.vmd)
+    if (!ctxA || !ctxB) return null
+    const frame = targetFrame ?? pickPeakPoseFrame(actorA.vmd, actorA.bones)
+
+    const W = 840
+    const H = 360
+    const panelW = 280
+    const panelH = 324
+    const canvas = new RasterCanvas(W, H, [248, 250, 252])
+
+    const ok = renderMultiActorFramePanels(
+      canvas,
+      [
+        { ctx: ctxA, placement: actorA.placement, tag: actorA.tag ?? "A", palette: DEFAULT_PALETTE },
+        { ctx: ctxB, placement: actorB.placement, tag: actorB.tag ?? "B", palette: PARTNER_PALETTE },
+      ],
+      frame,
+      0,
+      0,
+      panelH,
+      [
+        { kind: "front", label: "DUO FRONT (-Z)", width: panelW },
+        { kind: "side", label: "DUO SIDE (R)", width: panelW },
+        { kind: "three_quarter", label: "DUO 3/4 VIEW", width: panelW },
+      ]
+    )
+    if (!ok) return null
+
+    const timeSec = Number((frame / 30).toFixed(2))
+    canvas.fillRect(0, panelH, W, H - panelH, [15, 23, 42, 255])
+    canvas.drawText(
+      14,
+      panelH + 14,
+      `A=PINK/BLUE-RED   B=SKY/TEAL-AMBER   GAZE=GREEN   FLOOR=Y0   T=${timeSec.toFixed(2)}S`,
+      [226, 232, 240, 255],
+      1
+    )
+
+    const png = encodePng(W, H, canvas.px)
+    const base64 = Buffer.from(png).toString("base64")
+    return {
+      png,
+      base64,
+      dataUrl: `data:image/png;base64,${base64}`,
+      frame,
+      timeSec,
+      width: W,
+      height: H,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 渲染双人同框多帧分镜 PNG（每格含 FRONT + 3/4 VIEW，覆盖起承转合关键帧）。
+ */
+export function renderDuoStoryboardPng(
+  actorA: DuoRenderActor,
+  actorB: DuoRenderActor,
+  opts?: { maxTiles?: number; sampleFrames?: number[] }
+): RenderedStoryboardPng | null {
+  try {
+    const ctxA = buildSceneContext(actorA.bones, actorA.vmd)
+    const ctxB = buildSceneContext(actorB.bones, actorB.vmd)
+    if (!ctxA || !ctxB) return null
+
+    const maxFrame = Math.max(
+      ctxA.keys[ctxA.keys.length - 1]?.frame ?? 0,
+      ctxB.keys[ctxB.keys.length - 1]?.frame ?? 0
+    )
+    const cap = Math.max(2, Math.min(8, opts?.maxTiles ?? 6))
+    let tiles: StoryboardTile[]
+    if (Array.isArray(opts?.sampleFrames) && opts.sampleFrames.length > 0) {
+      tiles = [...new Set(opts.sampleFrames.map((f) => Math.max(0, Math.min(maxFrame, Math.round(f)))))]
+        .sort((a, b) => a - b)
+        .slice(0, cap)
+        .map((frame) => ({ frame, timeSec: Number((frame / 30).toFixed(2)) }))
+    } else {
+      tiles = []
+      const used = new Set<number>()
+      for (let i = 0; i < cap; i++) {
+        const f = maxFrame > 0 ? Math.round((i * maxFrame) / Math.max(1, cap - 1)) : 0
+        if (used.has(f)) continue
+        used.add(f)
+        tiles.push({ frame: f, timeSec: Number((f / 30).toFixed(2)) })
+      }
+    }
+    if (tiles.length === 0) return null
+
+    const cols = tiles.length <= 2 ? tiles.length : 2
+    const rows = Math.ceil(tiles.length / cols)
+    const subW = 220
+    const tileW = subW * 2
+    const tileH = 216
+    const legendH = 34
+    const W = cols * tileW
+    const H = rows * tileH + legendH
+    const canvas = new RasterCanvas(W, H, [248, 250, 252])
+
+    for (let i = 0; i < tiles.length; i++) {
+      const tile = tiles[i]
+      const col = i % cols
+      const row = Math.floor(i / cols)
+      const tx0 = col * tileW
+      const ty0 = row * tileH
+      renderMultiActorFramePanels(
+        canvas,
+        [
+          { ctx: ctxA, placement: actorA.placement, tag: actorA.tag ?? "A", palette: DEFAULT_PALETTE },
+          { ctx: ctxB, placement: actorB.placement, tag: actorB.tag ?? "B", palette: PARTNER_PALETTE },
+        ],
+        tile.frame,
+        tx0,
+        ty0,
+        tileH,
+        [
+          { kind: "front", label: `K${i} DUO FRONT`, width: subW },
+          { kind: "three_quarter", label: `3/4 T=${tile.timeSec.toFixed(1)}S`, width: subW },
+        ]
+      )
+      if (col > 0) canvas.line(tx0, ty0, tx0, ty0 + tileH, [100, 116, 139, 255], 2)
+      if (row > 0) canvas.line(tx0, ty0, tx0 + tileW, ty0, [100, 116, 139, 255], 2)
+    }
+
+    canvas.fillRect(0, rows * tileH, W, legendH, [15, 23, 42, 255])
+    canvas.drawText(
+      14,
+      rows * tileH + 13,
+      `DUO STORYBOARD ${tiles.length} FRAMES: A=PINK B=SKY GAZE=GREEN FLOOR=Y0`,
       [226, 232, 240, 255],
       1
     )

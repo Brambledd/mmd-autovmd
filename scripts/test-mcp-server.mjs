@@ -74,12 +74,13 @@ try {
     "export_motion",
     "inspect_vmd_file",
     "push_vmd_to_stage",
+    "inspect_duo",
   ])
   for (const t of listed.tools) {
     assert(t.description && t.description.length > 20, `${t.name} needs a description`)
     assert.equal(t.inputSchema.type, "object", `${t.name} schema must be an object`)
   }
-  console.log("  ok  tools/list (8 tools, make_motion first)")
+  console.log("  ok  tools/list (9 tools, make_motion first)")
 
   const modelsRes = await rpc("tools/call", { name: "list_models", arguments: {} })
   const models = JSON.parse(modelsRes.content[0].text)

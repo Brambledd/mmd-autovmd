@@ -11,6 +11,7 @@
  *   - export_motion
  *   - inspect_vmd_file
  *   - push_vmd_to_stage
+ *   - inspect_duo            (two-actor world transform, collision/distance check & duo render)
  *
  * IMPORTANT: stdout is strictly reserved for JSON-RPC 2.0 frames. All diagnostic
  * logs are redirected to stderr.
@@ -38,40 +39,114 @@ import { LEXICON, expandLexiconSegment } from "../lib/motion-lexicon.ts"
 import { critiquePoseVmd, parsePoseTextsAndTimeline } from "../lib/pose-critic.ts"
 import { auditVmd } from "../lib/pose-audit.ts"
 import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
-import { renderPoseMultiViewPng, renderStoryboardPng } from "../lib/pose-renderer.ts"
+import { renderPoseMultiViewPng, renderStoryboardPng, renderDuoMultiViewPng, renderDuoStoryboardPng } from "../lib/pose-renderer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
 import { measureGroundErrorVmd, summarizeGroundMeasure, type GroundMeasure } from "../lib/ground-bake.ts"
 import { finalizeMotion, type FinalizeResult } from "../lib/motion-finalize.ts"
 import { secondsToFrame } from "../lib/vmd-morph.ts"
+import {
+  analyzeDuoSequence,
+  prepareDuoActor,
+  toBlenderRootPlacement,
+  worldToActorLocal,
+  type DuoPlacement,
+} from "../lib/duo.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = path.resolve(__dirname, "../..")
 const PUBLIC_DIR = path.join(ROOT_DIR, "public")
 
+type ResolvedModelEntry = {
+  id: string
+  label: string
+  url: string
+  pmxPath?: string
+}
+
 const modelCache = new Map<string, PmxBones>()
 
-function resolveModelEntry(modelId?: string) {
+function scanPublicModels(): ResolvedModelEntry[] {
+  const modelsDir = path.join(PUBLIC_DIR, "models")
+  const knownByPath = new Map<string, ResolvedModelEntry>()
+  const seenIds = new Set<string>()
+  const result: ResolvedModelEntry[] = []
+
+  for (const m of AVAILABLE_MODELS) {
+    const abs = path.resolve(PUBLIC_DIR, m.url.replace(/^\/+/, ""))
+    knownByPath.set(abs.toLowerCase(), { ...m, pmxPath: abs })
+    seenIds.add(m.id)
+    result.push({ ...m, pmxPath: abs })
+  }
+
+  if (!fs.existsSync(modelsDir)) return result
+
+  const walk = (dir: string) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, ent.name)
+      if (ent.isDirectory()) {
+        walk(full)
+      } else if (ent.isFile() && ent.name.toLowerCase().endsWith(".pmx")) {
+        const key = full.toLowerCase()
+        if (knownByPath.has(key)) continue
+        const relFromPublic = "/" + path.relative(PUBLIC_DIR, full).replace(/\\/g, "/")
+        const parentDir = path.basename(path.dirname(full))
+        const baseName = path.basename(full, path.extname(full))
+        const id = parentDir && parentDir !== "models" ? parentDir : baseName
+        if (seenIds.has(id)) continue
+        seenIds.add(id)
+        result.push({
+          id,
+          label: baseName,
+          url: relFromPublic,
+          pmxPath: full,
+        })
+      }
+    }
+  }
+  walk(modelsDir)
+  return result
+}
+
+function resolveModelEntry(modelId?: string, pmxPath?: string): ResolvedModelEntry {
+  if (pmxPath && pmxPath.trim()) {
+    const absPath = path.resolve(ROOT_DIR, pmxPath.trim())
+    const baseName = path.basename(absPath, path.extname(absPath))
+    return {
+      id: modelId?.trim() || baseName || "custom",
+      label: baseName || "Custom PMX",
+      url: absPath,
+      pmxPath: absPath,
+    }
+  }
+  const all = scanPublicModels()
   const id = (modelId || "topaz").trim()
   return (
-    AVAILABLE_MODELS.find((m) => m.id === id || m.label === id) ??
-    AVAILABLE_MODELS[0]
+    all.find((m) => m.id === id || m.label === id) ??
+    all[0]
   )
 }
 
-function loadModelSync(modelId?: string): { entry: (typeof AVAILABLE_MODELS)[number]; bones: PmxBones } {
-  const entry = resolveModelEntry(modelId)
-  const cached = modelCache.get(entry.id)
+function loadModelSync(modelId?: string, pmxPath?: string): { entry: ResolvedModelEntry; bones: PmxBones } {
+  const entry = resolveModelEntry(modelId, pmxPath)
+  const fullPath = entry.pmxPath ?? path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
+  const cacheKey = `pmx:${path.resolve(fullPath).toLowerCase()}`
+  const cached = modelCache.get(cacheKey)
   if (cached) return { entry, bones: cached }
 
-  const rel = entry.url.replace(/^\/+/, "")
-  const fullPath = path.join(PUBLIC_DIR, rel)
   if (!fs.existsSync(fullPath)) {
     throw new Error(`Model file not found: ${fullPath}`)
   }
   const bytes = fs.readFileSync(fullPath)
   const bones = parsePmxBones(new Uint8Array(bytes))
-  modelCache.set(entry.id, bones)
+  modelCache.set(cacheKey, bones)
   return { entry, bones }
+}
+
+function loadModelFromArgs(args: Record<string, unknown>) {
+  return loadModelSync(
+    typeof args.modelId === "string" ? args.modelId : undefined,
+    typeof args.pmxPath === "string" ? args.pmxPath : undefined
+  )
 }
 
 /** Ensure standalone @pose/@animation fragments also compile by wrapping an implicit main block if missing. */
@@ -496,6 +571,7 @@ const TOOLS = [
         mirror: { type: "boolean", description: "Mirror the primitive left/right (default false)" },
         targetDuration: { type: "number", description: "Primitive only: stretch to about this many seconds by adding cycles (or hold)" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         sampleTimes: {
           type: "array",
           items: { type: "number" },
@@ -529,6 +605,7 @@ const TOOLS = [
       type: "object",
       properties: {
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
       },
       additionalProperties: false,
     },
@@ -542,6 +619,7 @@ const TOOLS = [
       properties: {
         mpl: { type: "string", description: "MPL2 script (@pose + @animation, optional main block)" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         sampleTimes: {
           type: "array",
           items: { type: "number" },
@@ -561,6 +639,7 @@ const TOOLS = [
       properties: {
         mpl: { type: "string", description: "MPL2 script (@pose + @animation, optional main block)" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         mode: {
           type: "string",
           enum: ["auto", "single", "storyboard"],
@@ -582,6 +661,7 @@ const TOOLS = [
       properties: {
         mpl: { type: "string", description: "Final MPL2 script" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         mode: {
           type: "string",
           enum: ["final", "blocking"],
@@ -614,6 +694,7 @@ const TOOLS = [
       properties: {
         vmdPath: { type: "string", description: "Path to the .vmd file (relative to repo root or absolute)" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         sampleTimes: {
           type: "array",
           items: { type: "number" },
@@ -637,6 +718,7 @@ const TOOLS = [
       properties: {
         vmdPath: { type: "string", description: "Path to the .vmd file (relative to repo root or absolute)" },
         modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path (relative to repo root or absolute), overriding modelId" },
         title: { type: "string", description: "Optional motion title shown in stage notice" },
         stageUrl: { type: "string", description: "PoPo web server URL (default: http://127.0.0.1:4000)" },
         force: {
@@ -648,19 +730,114 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "inspect_duo",
+    description:
+      "Inspect and render a two-person (duo) interactive scene by placing Actor A (default: topaz) and Actor B (default: caelus) in a shared duo world space using [offset, yawDeg]. Each actor takes either a .vmd file (vmdPath) or an MPL2 script (mpl, compiled & ground-baked on the fly). Returns world-space landmarks, cross-actor hand/head/chest distances (distancesUnits & minWristPair), cross-actor clipping issues (torso_clipping, head_clipping, hand_inside_partner), Blender root placements (location in meters, rotation_euler_z_deg), optional worldToActorLocal conversion for exact 'reach hand_<l|r> to [x,y,z];' targeting, and side-by-side duo orthographic multi-view / storyboard PNGs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        actorA: {
+          type: "object",
+          description: "First character (rendered in pink/magenta palette with badge A)",
+          properties: {
+            modelId: { type: "string", description: "Model id (default: topaz)" },
+            pmxPath: { type: "string", description: "Optional local .pmx path, overriding modelId" },
+            label: { type: "string", description: "Display label (default: A)" },
+            vmdPath: { type: "string", description: "Path to .vmd file (mutually exclusive with mpl)" },
+            mpl: { type: "string", description: "MPL2 script to compile & ground-bake on the fly (mutually exclusive with vmdPath)" },
+            offset: {
+              type: "array",
+              items: { type: "number" },
+              minItems: 3,
+              maxItems: 3,
+              description: "Shared world offset [x, y, z] in MMD units (1u = 8cm). Default: [0, 0, 0]",
+            },
+            yawDeg: {
+              type: "number",
+              description: "Heading in degrees (0 = -Z forward, +90 = +X left/toward partner, -90 = -X right, 180 = +Z). Matches Blender root.rotation_euler.z.",
+            },
+          },
+          additionalProperties: false,
+        },
+        actorB: {
+          type: "object",
+          description: "Second character (rendered in sky/teal palette with badge B)",
+          properties: {
+            modelId: { type: "string", description: "Model id (default: caelus)" },
+            pmxPath: { type: "string", description: "Optional local .pmx path, overriding modelId" },
+            label: { type: "string", description: "Display label (default: B)" },
+            vmdPath: { type: "string", description: "Path to .vmd file (mutually exclusive with mpl)" },
+            mpl: { type: "string", description: "MPL2 script to compile & ground-bake on the fly (mutually exclusive with vmdPath)" },
+            offset: {
+              type: "array",
+              items: { type: "number" },
+              minItems: 3,
+              maxItems: 3,
+              description: "Shared world offset [x, y, z] in MMD units (1u = 8cm). Default: [0, 0, 0]",
+            },
+            yawDeg: {
+              type: "number",
+              description: "Heading in degrees (0 = -Z forward, +90 = +X, -90 = -X, 180 = +Z).",
+            },
+          },
+          additionalProperties: false,
+        },
+        sampleTimes: {
+          type: "array",
+          items: { type: "number" },
+          description: "Optional timestamps (in seconds) to evaluate cross-actor distances and world landmarks",
+        },
+        renderViews: {
+          type: "boolean",
+          description: "Render duo orthographic multi-view / storyboard PNG (default: true)",
+        },
+        mode: {
+          type: "string",
+          enum: ["auto", "single", "storyboard"],
+          description: "Render mode (default: auto — storyboard if duration >= 1.5s, else single 3-view)",
+        },
+        timeSec: {
+          type: "number",
+          description: "Target timestamp in seconds when mode='single'",
+        },
+        maxTiles: {
+          type: "number",
+          description: "Max storyboard tiles (default: 6)",
+        },
+        convertWorldPointFor: {
+          type: "object",
+          description: "Optional helper: convert a shared world [x, y, z] coordinate (e.g. partner's landmarksWorld.handR) into actor-local [x, y, z] for 'reach hand_<l|r> to [x,y,z];'",
+          properties: {
+            actor: { type: "string", enum: ["A", "B"] },
+            worldPoint: {
+              type: "array",
+              items: { type: "number" },
+              minItems: 3,
+              maxItems: 3,
+            },
+          },
+          required: ["actor", "worldPoint"],
+          additionalProperties: false,
+        },
+      },
+      required: ["actorA", "actorB"],
+      additionalProperties: false,
+    },
+  },
 ]
 
 async function handleToolCall(name: string, args: Record<string, unknown>) {
   if (name === "list_models") {
-    const models = AVAILABLE_MODELS.map((m) => {
-      const fullPath = path.join(PUBLIC_DIR, m.url.replace(/^\/+/, ""))
-      return { ...m, exists: fs.existsSync(fullPath) }
+    const models = scanPublicModels().map((m) => {
+      const fullPath = m.pmxPath ?? path.join(PUBLIC_DIR, m.url.replace(/^\/+/, ""))
+      return { id: m.id, label: m.label, url: m.url, exists: fs.existsSync(fullPath) }
     })
     return { content: [{ type: "text", text: JSON.stringify(models, null, 2) }] }
   }
 
   if (name === "inspect_pmx") {
-    const { entry, bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { entry, bones } = loadModelFromArgs(args)
     const cond = buildModelConditioning(bones)
     const payload = {
       model: entry,
@@ -684,7 +861,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const rawMpl = typeof args.mpl === "string" ? args.mpl : ""
     if (!rawMpl.trim()) throw new Error("mpl is required")
     const mpl = ensureCompilableMpl(rawMpl)
-    const { bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { bones } = loadModelFromArgs(args)
     const compiler = await getServerCompiler()
     if (!compiler) throw new Error("WASM MPL compiler unavailable")
 
@@ -764,7 +941,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const rawMpl = typeof args.mpl === "string" ? args.mpl : ""
     if (!rawMpl.trim()) throw new Error("mpl is required")
     const mpl = ensureCompilableMpl(rawMpl)
-    const { bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { bones } = loadModelFromArgs(args)
     const compiler = await getServerCompiler()
     if (!compiler) throw new Error("WASM MPL compiler unavailable")
 
@@ -842,7 +1019,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const rawMpl = typeof args.mpl === "string" ? args.mpl : ""
     if (!rawMpl.trim()) throw new Error("mpl is required")
     const mpl = ensureCompilableMpl(rawMpl)
-    const { entry, bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { entry, bones } = loadModelFromArgs(args)
     const compiler = await getServerCompiler()
     if (!compiler) throw new Error("WASM MPL compiler unavailable")
 
@@ -987,7 +1164,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const rawMpl = typeof args.mpl === "string" ? args.mpl : ""
     const primitiveName = typeof args.primitive === "string" ? args.primitive.trim() : ""
     if (!rawMpl.trim() && !primitiveName) throw new Error("provide either mpl (MPL2 script) or primitive (lexicon name)")
-    const { entry, bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { entry, bones } = loadModelFromArgs(args)
     const compiler = await getServerCompiler()
     if (!compiler) throw new Error("WASM MPL compiler unavailable")
 
@@ -1205,7 +1382,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const absPath = path.resolve(ROOT_DIR, rawPath)
     if (!fs.existsSync(absPath)) throw new Error(`VMD file not found: ${absPath}`)
     const vmdBytes = new Uint8Array(fs.readFileSync(absPath))
-    const { bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { bones } = loadModelFromArgs(args)
     const keys = readVmdBoneKeys(vmdBytes) ?? []
     if (keys.length === 0) {
       throw new Error(`VMD contains 0 bone keyframes: ${absPath}`)
@@ -1295,7 +1472,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const absPath = path.resolve(ROOT_DIR, rawPath)
     if (!fs.existsSync(absPath)) throw new Error(`VMD file not found: ${absPath}`)
     const vmdBytes = new Uint8Array(fs.readFileSync(absPath))
-    const { bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const { bones } = loadModelFromArgs(args)
     const keys = readVmdBoneKeys(vmdBytes) ?? []
     if (keys.length === 0) throw new Error(`VMD contains 0 bone keyframes: ${absPath}`)
 
@@ -1374,6 +1551,150 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         },
       ],
     }
+  }
+
+  if (name === "inspect_duo") {
+    const rawA = (args.actorA && typeof args.actorA === "object" ? args.actorA : {}) as Record<string, unknown>
+    const rawB = (args.actorB && typeof args.actorB === "object" ? args.actorB : {}) as Record<string, unknown>
+
+    const normalizeOffset = (val: unknown): [number, number, number] => {
+      if (Array.isArray(val) && val.length >= 3) {
+        return [Number(val[0]) || 0, Number(val[1]) || 0, Number(val[2]) || 0]
+      }
+      return [0, 0, 0]
+    }
+
+    const resolveActor = async (
+      raw: Record<string, unknown>,
+      defaultModelId: string,
+      fallbackLabel: string
+    ) => {
+      const modelId = typeof raw.modelId === "string" && raw.modelId.trim() ? raw.modelId.trim() : defaultModelId
+      const pmxPath = typeof raw.pmxPath === "string" && raw.pmxPath.trim() ? raw.pmxPath.trim() : undefined
+      const label = typeof raw.label === "string" && raw.label.trim() ? raw.label.trim() : fallbackLabel
+      const { entry, bones } = loadModelSync(modelId, pmxPath)
+      const placement: DuoPlacement = {
+        offset: normalizeOffset(raw.offset),
+        yawDeg: Number.isFinite(Number(raw.yawDeg)) ? Number(raw.yawDeg) : 0,
+      }
+
+      const vmdPathArg = typeof raw.vmdPath === "string" ? raw.vmdPath.trim() : ""
+      const mplArg = typeof raw.mpl === "string" ? raw.mpl : ""
+      let vmd: Uint8Array
+      let sourceDesc: Record<string, unknown>
+      if (vmdPathArg) {
+        const abs = path.resolve(ROOT_DIR, vmdPathArg)
+        if (!fs.existsSync(abs)) throw new Error(`${fallbackLabel}: VMD file not found: ${abs}`)
+        vmd = new Uint8Array(fs.readFileSync(abs))
+        sourceDesc = { type: "vmd", vmdPath: abs, vmdBytes: vmd.length }
+      } else if (mplArg.trim()) {
+        const compiler = await getServerCompiler()
+        if (!compiler) throw new Error("WASM MPL compiler unavailable")
+        const compiled = compileMPL2(compiler, ensureCompilableMpl(mplArg), bones)
+        if (compiled.vmd.length === 0) {
+          throw new Error(`${fallbackLabel} MPL compile failed: ${compiled.directiveErrors.join("; ") || "0 bytes"}`)
+        }
+        const fin = finalizeMotion(compiled.vmd, bones, { enhance: true, bake: true })
+        vmd = fin.vmd
+        sourceDesc = {
+          type: "mpl",
+          vmdBytes: vmd.length,
+          compilerWarnings: compiled.warnings.slice(0, 8),
+        }
+      } else {
+        throw new Error(`${fallbackLabel} requires either vmdPath or mpl`)
+      }
+
+      const prep = prepareDuoActor({ label, bones, vmd, placement }, fallbackLabel)
+      if (!prep) throw new Error(`${fallbackLabel} VMD contains 0 bone keyframes`)
+      return { entry, bones, vmd, placement, prep, label, sourceDesc }
+    }
+
+    const actA = await resolveActor(rawA, "topaz", "A")
+    const actB = await resolveActor(rawB, "caelus", "B")
+
+    const sampleTimes = Array.isArray(args.sampleTimes)
+      ? args.sampleTimes.map(Number).filter(Number.isFinite)
+      : undefined
+    const analysis = analyzeDuoSequence(actA.prep, actB.prep, sampleTimes)
+
+    let convertedLocalPoint: Record<string, unknown> | undefined
+    if (args.convertWorldPointFor && typeof args.convertWorldPointFor === "object") {
+      const conv = args.convertWorldPointFor as Record<string, unknown>
+      const which = conv.actor === "B" ? "B" : "A"
+      const wp = normalizeOffset(conv.worldPoint)
+      const targetPlacement = which === "B" ? actB.placement : actA.placement
+      const localPt = worldToActorLocal({ x: wp[0], y: wp[1], z: wp[2] }, targetPlacement)
+      convertedLocalPoint = {
+        actor: which,
+        worldPoint: wp,
+        localPoint: localPt,
+        reachExample: `reach hand_r to [${localPt[0]}, ${localPt[1]}, ${localPt[2]}];`,
+      }
+    }
+
+    const content: Array<Record<string, unknown>> = []
+    let renderInfo: Record<string, unknown> | undefined
+    if (args.renderViews !== false) {
+      const modeArg = typeof args.mode === "string" ? args.mode : "auto"
+      const useSingle = modeArg === "single" || (modeArg === "auto" && analysis.durationSec < 1.5)
+      const renderA = { bones: actA.bones, vmd: actA.vmd, placement: actA.placement, tag: actA.label }
+      const renderB = { bones: actB.bones, vmd: actB.vmd, placement: actB.placement, tag: actB.label }
+
+      if (useSingle) {
+        const targetFrame = typeof args.timeSec === "number" && Number.isFinite(args.timeSec)
+          ? secondsToFrame(args.timeSec)
+          : undefined
+        const png = renderDuoMultiViewPng(renderA, renderB, targetFrame)
+        if (png) {
+          content.push({
+            type: "image",
+            data: png.dataUrl.replace(/^data:image\/png;base64,/, ""),
+            mimeType: "image/png",
+          })
+          renderInfo = { mode: "single", frame: png.frame, timeSec: png.timeSec, width: png.width, height: png.height }
+        }
+      } else {
+        const maxTiles = typeof args.maxTiles === "number" && Number.isFinite(args.maxTiles) ? args.maxTiles : 6
+        const sampleFrames = sampleTimes?.map((t) => secondsToFrame(t))
+        const sb = renderDuoStoryboardPng(renderA, renderB, { maxTiles, sampleFrames })
+        if (sb) {
+          content.push({
+            type: "image",
+            data: sb.dataUrl.replace(/^data:image\/png;base64,/, ""),
+            mimeType: "image/png",
+          })
+          renderInfo = { mode: "storyboard", tiles: sb.tiles, width: sb.width, height: sb.height }
+        }
+      }
+    }
+
+    const report = {
+      ok: analysis.passed,
+      durationSec: analysis.durationSec,
+      maxFrame: analysis.maxFrame,
+      actorA: {
+        label: actA.label,
+        model: { id: actA.entry.id, label: actA.entry.label },
+        placement: actA.placement,
+        blenderRoot: toBlenderRootPlacement(actA.placement),
+        source: actA.sourceDesc,
+      },
+      actorB: {
+        label: actB.label,
+        model: { id: actB.entry.id, label: actB.entry.label },
+        placement: actB.placement,
+        blenderRoot: toBlenderRootPlacement(actB.placement),
+        source: actB.sourceDesc,
+      },
+      convertedLocalPoint,
+      issues: analysis.allIssues,
+      frames: analysis.frames,
+      render: renderInfo,
+    }
+
+    content.push({ type: "text", text: stringifyReport(report) })
+    return { content }
   }
 
   throw new Error(`Unknown tool: ${name}`)

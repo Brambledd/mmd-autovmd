@@ -335,3 +335,83 @@ bpy.ops.mmd_tools.export_vmd(
 - **Blender 4.3.2 API**: `fcurve.keyframe_points.find(frame)` returns an **int index**; mmd_tools renames limb bones on import (`左足` → `足.L`), so build F-curve data paths from the bone found by `mmd_bone.name_j`; `to_mesh()` per frame is fine (278 frames ≈ 5 s); an exception in an `execute_blender_code` block discards all earlier `print`s of that block.
 - **Measure the raw error with a full sweep before the per-frame correction loop.** A "before" value read inside the loop hides nearly all of it (showed −0.9 cm for a real −10.7 cm) because the earlier frames are already corrected by then.
 - **Frames**: Blender frame = VMD frame + 1 (a squat bottom at 2.0 s is VMD 60 = Blender 61).
+
+---
+
+## Duo / Two-Person Interactive Workflow (`inspect_duo` + Dual-Rig Blender)
+
+Use this when two characters (e.g. `topaz` + `caelus`, or any `.pmx` via `pmxPath`) must share a scene (handshake, hug, high-five, duet). **PoPo's 3D web stage is single-model (`reze-engine`)**, so PoPo checks & renders duo alignment in a shared world via `inspect_duo`, and **Blender `mmd_tools` is the final duo viewport, contact polish, and dual-`.vmd` export environment**.
+
+### Stage 1 — Author Each Actor & Align via `popo-mmd.inspect_duo`
+
+1. Author Actor A (`mplA`) and Actor B (`mplB`) in their own local spaces (`0 = -Z` forward), or start from blocking motions exported with `export_motion(mode="blocking")` / `make_motion`.
+2. Choose shared world placements `{ offset: [x, y, z], yawDeg }`:
+   - Face-to-face handshake / high-five: A at `offset: [-5, 0, 0], yawDeg: +90` (faces `+X`), B at `offset: [+5, 0, 0], yawDeg: -90` (faces `-X`).
+   - Units: `1 u = 8 cm` (`10 u = 80 cm` center-to-center; Blender meter scale `0.08`). `yawDeg` matches Blender `root.rotation_euler.z` (`+90` = facing `+X`).
+3. Call `popo-mmd.inspect_duo` with `actorA`, `actorB`, `sampleTimes`, and `renderViews: true`:
+   - Read `frames[].distancesUnits.minWristPair` (`distUnits`, `distCm`) and `landmarksWorld` (world-space positions of `センター`, `頭`, `左手首`, `右手首`, `左足首`, `右足首`).
+   - Check `issues` for `torso_clipping`, `head_clipping`, or `hand_inside_partner`.
+   - To aim Actor A's hand at Actor B's world hand landmark (or midpoint), pass `convertWorldPointFor: { actor: "A", worldPoint: [...] }` to `inspect_duo` (which applies `worldToActorLocal`) and paste the returned `[x, y, z]` directly into `reach hand_r to [x, y, z];` in Actor A's MPL!
+4. Export both blocking `.vmd` files (`actor_a_blocking.vmd`, `actor_b_blocking.vmd`) via `export_motion(..., mode="blocking", outBasePath=...)` — or keep both finalized `.vmd`s if only minor contact touch-up is needed.
+
+### Stage 2 — Import & Polish Both Rigs in Blender (`mmd_tools`)
+
+> [!CAUTION]
+> **NEVER** use `next(o for o in bpy.data.objects if o.type == "ARMATURE")` or `... if o.mmd_type == "ROOT"` in a duo scene — you will overwrite or export the wrong character! Always capture explicit object references immediately on import and record their names (`"root_A"`, `"root_B"`).
+
+1. **Import both models and place their `ROOT` objects using `report.actorA.blenderRoot` / `actorB.blenderRoot` from `inspect_duo`**:
+
+```python
+import bpy, math
+
+def import_rig(pmx_path, location, rot_z_deg, tag):
+    before = set(bpy.data.objects.keys())
+    bpy.ops.mmd_tools.import_model(filepath=pmx_path, scale=0.08)
+    new_objs = [bpy.data.objects[k] for k in bpy.data.objects.keys() if k not in before]
+    root = next(o for o in new_objs if getattr(o, "mmd_type", "") == "ROOT")
+    arm = next(o for o in new_objs if o.type == "ARMATURE")
+    root.name = f"ROOT_{tag}"
+    arm.name = f"ARM_{tag}"
+    root.location = tuple(location)
+    root.rotation_euler = (0.0, 0.0, math.radians(rot_z_deg))
+    return root, arm
+
+# Coordinates come directly from inspect_duo's blenderRoot:
+root_a, arm_a = import_rig(PMX_A, BLA_LOC, BLA_YAW_DEG, "A")
+root_b, arm_b = import_rig(PMX_B, BLB_LOC, BLB_YAW_DEG, "B")
+```
+
+2. **Import each `.vmd` onto its own `arm` & build separate `jp_bones` maps** (activating `arm_a` before importing `actor_a_blocking.vmd`, and `arm_b` before `actor_b_blocking.vmd`, with `margin=0`):
+
+```python
+for arm, vmd_path in [(arm_a, VMD_A), (arm_b, VMD_B)]:
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.mmd_tools.import_vmd(filepath=vmd_path, scale=0.08, margin=0)
+    # Disable Leg IK when FK legs are keyed (required per rig):
+    for pb in arm.pose.bones:
+        if "IK" in pb.mmd_bone.name_j and ("足" in pb.name or "つま先" in pb.name):
+            pb.mmd_ik_toggle = False
+
+jp_a = {pb.mmd_bone.name_j: pb.name for pb in arm_a.pose.bones if not pb.mmd_bone.is_mmd_shadow_bone}
+jp_b = {pb.mmd_bone.name_j: pb.name for pb in arm_b.pose.bones if not pb.mmd_bone.is_mmd_shadow_bone}
+```
+
+3. **Polish in world space**:
+   - Inspect hand-to-hand / hand-to-shoulder contact by computing world wrist positions via `arm.matrix_world @ pb.head` (or evaluated mesh hand vertices) across the interaction frames, and refine `肩` / `腕` / `ひじ` / finger bones (`右親指*`, `右人指*`, ...) so palms/fingers wrap cleanly without intersecting.
+   - Smooth F-Curves (`AUTO_CLAMPED` on `QUATERNION` rotation/location) and run the shoe-sole ground-contact cleanup per rig (`arm_a`, then `arm_b`) before final export.
+4. **Export two separate `.vmd` files** by selecting/activating **`root_a`** first, then **`root_b`**:
+
+```python
+for root, out_path in [(root_a, FINAL_VMD_A), (root_b, FINAL_VMD_B)]:
+    bpy.ops.object.select_all(action="DESELECT")
+    root.select_set(True)
+    bpy.context.view_layer.objects.active = root
+    bpy.ops.mmd_tools.export_vmd(filepath=out_path, scale=12.5, use_frame_range=True)
+    assert os.path.exists(out_path) and os.path.getsize(out_path) > 0
+```
+
+### Stage 3 — Final Duo Verification
+
+- Re-run `popo-mmd.inspect_duo` on `FINAL_VMD_A` and `FINAL_VMD_B` with the same `offset`/`yawDeg` and `renderViews: true` to confirm zero cross-actor clipping and expected contact distances, and run `popo-mmd.inspect_vmd_file` on each actor individually to confirm single-rig grounding (`offendingFrames: 0`).
