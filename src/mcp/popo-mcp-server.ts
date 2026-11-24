@@ -3,11 +3,14 @@
  *
  * Exposes PoPo's deterministic 3D toolchain as MCP tools for external Agents (dsh,
  * Claude Code, Antigravity, Cursor, etc.):
+ *   - make_motion            (one call: compile → finalize → gate → storyboard → report)
  *   - list_models
  *   - inspect_pmx
  *   - compile_and_inspect_mpl2
  *   - render_pose_views
  *   - export_motion
+ *   - inspect_vmd_file
+ *   - push_vmd_to_stage
  *
  * IMPORTANT: stdout is strictly reserved for JSON-RPC 2.0 frames. All diagnostic
  * logs are redirected to stderr.
@@ -31,13 +34,13 @@ import { buildModelConditioning } from "../lib/model-conditioning.ts"
 import { detectPosSemantics, measureModelGeometry, restWorldPositions } from "../lib/model-geometry.ts"
 import { compileMPL2 } from "../lib/mpl2.ts"
 import { VALID_AIM_TARGETS, VALID_REACH_ANCHORS } from "../lib/ik-solver.ts"
-import { LEXICON } from "../lib/motion-lexicon.ts"
-import { critiquePoseVmd } from "../lib/pose-critic.ts"
+import { LEXICON, expandLexiconSegment } from "../lib/motion-lexicon.ts"
+import { critiquePoseVmd, parsePoseTextsAndTimeline } from "../lib/pose-critic.ts"
 import { auditVmd } from "../lib/pose-audit.ts"
 import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
 import { renderPoseMultiViewPng, renderStoryboardPng } from "../lib/pose-renderer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
-import { measureGroundErrorVmd, summarizeGroundMeasure } from "../lib/ground-bake.ts"
+import { measureGroundErrorVmd, summarizeGroundMeasure, type GroundMeasure } from "../lib/ground-bake.ts"
 import { finalizeMotion, type FinalizeResult } from "../lib/motion-finalize.ts"
 import { secondsToFrame } from "../lib/vmd-morph.ts"
 
@@ -194,6 +197,12 @@ function groundReport(fin: FinalizeResult) {
       `${bs.residualAtEntries} of those are authored key poses (ground bake never rewrites key poses) — ` +
         `add "plant feet;" to the pose(s) at those frames, or accept the offset`
     )
+  } else if (g && g.offendingFrames > 0 && bs && bs.skippedReason === "no grounded transition (nothing between contact keys)") {
+    // 没有可修的过渡段：超差帧全在保持中的作者姿势上（烘焙只修关键帧之间的中间帧）
+    notes.push(
+      "the ground bake only corrects frames between contact keys and this motion has no such transition — " +
+        `the offset is in the authored pose(s) themselves: bend the knees / add "plant feet;" / raise the center, or accept the offset`
+    )
   }
   return {
     ground: g,
@@ -256,6 +265,110 @@ function describeGroundEn(fin: FinalizeResult): string {
 function groundSummaryOf(bones: PmxBones, vmd: Uint8Array) {
   const m = measureGroundErrorVmd(vmd, bones)
   return m ? summarizeGroundMeasure(m) : null
+}
+
+/**
+ * make_motion 的逐帧曲线（按舞台引擎插值规则，与 critic / 贴地测量同源）：
+ *   footL / footR  —— 每只脚最低观测点相对静止脚踝/脚尖高度的偏移（u，负 = 沉入地面）
+ *   footLiftL / R  —— 脚踝相对静止脚踝高（u，> 0 = 抬脚）
+ *   hipDrop        —— 重心相对静止高度下降多少（u）
+ * 帧数多时按 stride 降采样到 ≤ maxPoints 个点（末帧一定包含）。
+ */
+function motionCurves(bones: PmxBones, vmd: Uint8Array, measure: GroundMeasure | null, maxPoints = 240) {
+  const keys = readVmdBoneKeys(vmd)
+  if (!keys || keys.length === 0 || !measure) return null
+  const tracks = buildBoneTracks(keys)
+  const sem = detectPosSemantics(bones)
+  const maxFrame = keys.reduce((m, k) => Math.max(m, k.frame), 0)
+  const stride = Math.max(1, Math.ceil((maxFrame + 1) / maxPoints))
+  const { restAnkleY, restCenterY } = getRestAnchors(bones)
+  const cIdx = bones.indexByJp.get("センター")
+  const alIdx = bones.indexByJp.get("左足首")
+  const arIdx = bones.indexByJp.get("右足首")
+  const r3 = (n: number) => Number(n.toFixed(3))
+  const c = { t: [] as number[], footL: [] as number[], footR: [] as number[], footLiftL: [] as number[], footLiftR: [] as number[], hipDrop: [] as number[] }
+  for (let f = 0; f <= maxFrame; f += stride) {
+    if (f + stride > maxFrame && f !== maxFrame) f = maxFrame // 末帧一定采样
+    const tf = samplePoseTransforms(bones, tracks, f, sem)
+    if (!tf) continue
+    c.t.push(r3(f / 30))
+    c.footL.push(r3(measure.error.l[f]))
+    c.footR.push(r3(measure.error.r[f]))
+    c.footLiftL.push(alIdx != null ? r3(tf.pos[alIdx].y - restAnkleY) : 0)
+    c.footLiftR.push(arIdx != null ? r3(tf.pos[arIdx].y - restAnkleY) : 0)
+    c.hipDrop.push(cIdx != null ? r3(restCenterY - tf.pos[cIdx].y) : 0)
+  }
+  const extreme = (arr: number[], pick: "max" | "min") => {
+    let best = 0
+    let at = 0
+    arr.forEach((v, i) => {
+      if ((pick === "max" ? v > best : v < best) || i === 0) {
+        best = v
+        at = i
+      }
+    })
+    return { value: best, t: c.t[at] }
+  }
+  return {
+    frames: maxFrame + 1,
+    fps: 30,
+    stride,
+    unit: "u (1u ≈ 8cm)",
+    tolerance: measure.tolerance,
+    peaks: {
+      hipDropMax: extreme(c.hipDrop, "max"),
+      footLiftMaxL: extreme(c.footLiftL, "max"),
+      footLiftMaxR: extreme(c.footLiftR, "max"),
+      footDeepestL: extreme(c.footL, "min"),
+      footDeepestR: extreme(c.footR, "min"),
+      footHighestL: extreme(c.footL, "max"),
+      footHighestR: extreme(c.footR, "max"),
+    },
+    ...c,
+  }
+}
+
+/**
+ * 面向 Agent 的 JSON 排版：对象缩进（好读）；数字/字符串数组单行，纯标量对象的数组每项一行
+ * （遥测曲线、判定帧表不炸 token）。
+ */
+function isFlatObject(v: unknown): boolean {
+  return v !== null && typeof v === "object" && !Array.isArray(v) && Object.values(v as Record<string, unknown>).every((x) => x === null || typeof x !== "object")
+}
+function stringifyReport(value: unknown, indent = 0): string {
+  const pad = "  ".repeat(indent)
+  const padIn = "  ".repeat(indent + 1)
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]"
+    if (value.every((v) => v === null || typeof v !== "object")) return JSON.stringify(value)
+    if (value.every(isFlatObject)) return "[\n" + value.map((v) => padIn + JSON.stringify(v)).join(",\n") + "\n" + pad + "]"
+    return "[\n" + value.map((v) => padIn + stringifyReport(v, indent + 1)).join(",\n") + "\n" + pad + "]"
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined)
+    if (entries.length === 0) return "{}"
+    if (isFlatObject(value)) return "{" + entries.map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(", ") + "}"
+    return "{\n" + entries.map(([k, v]) => `${padIn}${JSON.stringify(k)}: ${stringifyReport(v, indent + 1)}`).join(",\n") + "\n" + pad + "}"
+  }
+  return JSON.stringify(value)
+}
+
+/**
+ * 把成品 VMD 推到舞台（export_motion / make_motion 共用）。带字节：舞台拿到 vmdBase64 就按字节播放，
+ * 烘焙键不会在客户端重新编译/增强时丢失；mpl 只作编辑器标签。
+ */
+async function pushMotionToStage(args: Record<string, unknown>, body: Record<string, unknown>): Promise<unknown> {
+  const stageUrl = (typeof args.stageUrl === "string" && args.stageUrl.trim() ? args.stageUrl.trim() : "http://127.0.0.1:4000").replace(/\/+$/, "")
+  try {
+    const pushRes = await fetch(`${stageUrl}/api/stage-push`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    return pushRes.ok ? await pushRes.json() : { ok: false, status: pushRes.status, error: await pushRes.text().catch(() => "") }
+  } catch (e) {
+    return { ok: false, error: `Stage server unreachable at ${stageUrl} (${e instanceof Error ? e.message : String(e)})` }
+  }
 }
 
 function buildBiomechanicalWarnings(
@@ -366,6 +479,43 @@ const MPL2_AUTHORING_GUIDE = {
 }
 
 const TOOLS = [
+  {
+    name: "make_motion",
+    description:
+      "One-call motion maker — start here. Input is either an MPL2 script (mpl) or a lexicon primitive with params (e.g. primitive='squat', params={depth:1, cycles:3, tempo:1}; primitive names and params are listed by inspect_pmx). The call compiles, finalizes (vmd-enhancer + ground-contact bake = exactly what the stage plays and what export_motion final writes), runs the per-frame kinematic + ground-contact quality gate, renders a storyboard PNG, and returns ONE report: verdict (ok, critic, groundContact, groundNotes, actionableWarnings), vmd (bytes, sha256, key count, file path when saved), per-frame foot/hip height curves (footL/footR sole offset vs rest foot height, footLift, hipDrop), a telemetry row per authored timeline entry (keyframes), exact 3D bone coordinates at sampleTimes (coords), and the storyboard tiles. Options: outBasePath writes <base>.mpl/.vmd/.png/.json; pushToStage sends the final bytes to the PoPo stage; force returns a failed report instead of an MCP error. The step-by-step tools (compile_and_inspect_mpl2, render_pose_views, export_motion, ...) stay available.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mpl: { type: "string", description: "MPL2 script (@pose + @animation + main). Mutually exclusive with primitive." },
+        primitive: { type: "string", description: "Lexicon primitive name, e.g. squat, bow, wave_hand (see the inspect_pmx lexicon list)" },
+        params: {
+          type: "object",
+          additionalProperties: { type: "number" },
+          description: 'Primitive params, e.g. {"depth": 1, "cycles": 3}. Out-of-range values are clamped, unknown names ignored.',
+        },
+        mirror: { type: "boolean", description: "Mirror the primitive left/right (default false)" },
+        targetDuration: { type: "number", description: "Primitive only: stretch to about this many seconds by adding cycles (or hold)" },
+        modelId: { type: "string", description: "Model id (default: topaz)" },
+        sampleTimes: {
+          type: "array",
+          items: { type: "number" },
+          description: "Optional timestamps (seconds) to also return exact 3D bone coordinates (coords) on the final motion",
+        },
+        title: { type: "string", description: "Optional motion title (stage notice / storyboard label)" },
+        outBasePath: {
+          type: "string",
+          description: "Optional file path prefix (relative to repo root): writes <base>.mpl, .vmd, .png (storyboard) and .json (this report)",
+        },
+        pushToStage: { type: "boolean", description: "Push the final VMD bytes to the running PoPo stage (default false; only when the gate passes or force=true)" },
+        stageUrl: { type: "string", description: "PoPo web server URL (default: http://127.0.0.1:4000)" },
+        includeVmdBase64: { type: "boolean", description: "Embed the final VMD bytes as base64 in the report (default false)" },
+        storyboard: { type: "boolean", description: "Render the storyboard PNG (default true; a 3-view PNG when the motion is shorter than 1.5s)" },
+        maxTiles: { type: "number", description: "Max storyboard tiles (default 6)" },
+        force: { type: "boolean", description: "Return the report (ok=false) instead of an MCP error when the quality gate fails (default false)" },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: "list_models",
     description: "List available .pmx character models in the PoPo workspace.",
@@ -778,30 +928,14 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
 
     let stagePushResult: unknown = { skipped: true }
     if (shouldPush) {
-      const stageUrl = (typeof args.stageUrl === "string" && args.stageUrl.trim() ? args.stageUrl.trim() : "http://127.0.0.1:4000").replace(/\/+$/, "")
-      try {
-        const pushRes = await fetch(`${stageUrl}/api/stage-push`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          // 带 VMD 字节：舞台拿到 vmdBase64 就按字节播放，烘焙键不会在客户端重新编译/增强时丢失；
-          // mpl 只作编辑器标签。baseRotated/legsKeyed 取自 compileMPL2（与舞台 MPL 路径判定同源）。
-          body: JSON.stringify({
-            mpl,
-            vmdBase64: Buffer.from(finalVmd).toString("base64"),
-            baseRotated: Boolean(res.baseRotated),
-            legsKeyed: Boolean(res.legsKeyed),
-            title: typeof args.title === "string" ? args.title : undefined,
-          }),
-        })
-        stagePushResult = pushRes.ok
-          ? await pushRes.json()
-          : { ok: false, status: pushRes.status, error: await pushRes.text().catch(() => "") }
-      } catch (e) {
-        stagePushResult = {
-          ok: false,
-          error: `Stage server unreachable at ${stageUrl} (${e instanceof Error ? e.message : String(e)})`,
-        }
-      }
+      // baseRotated / legsKeyed 取自 compileMPL2（与舞台 MPL 路径判定同源）。
+      stagePushResult = await pushMotionToStage(args, {
+        mpl,
+        vmdBase64: Buffer.from(finalVmd).toString("base64"),
+        baseRotated: Boolean(res.baseRotated),
+        legsKeyed: Boolean(res.legsKeyed),
+        title: typeof args.title === "string" ? args.title : undefined,
+      })
     }
 
     const pmxAbsPath = path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
@@ -848,6 +982,222 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         },
       ],
     }
+  }
+
+  if (name === "make_motion") {
+    const rawMpl = typeof args.mpl === "string" ? args.mpl : ""
+    const primitiveName = typeof args.primitive === "string" ? args.primitive.trim() : ""
+    if (!rawMpl.trim() && !primitiveName) throw new Error("provide either mpl (MPL2 script) or primitive (lexicon name)")
+    const { entry, bones } = loadModelSync(typeof args.modelId === "string" ? args.modelId : undefined)
+    const compiler = await getServerCompiler()
+    if (!compiler) throw new Error("WASM MPL compiler unavailable")
+
+    // 1) 来源：词库原语 + 参数（clamp / 目标时长自适应 / 镜像都在 expandLexiconSegment 里），或直接给 MPL 脚本
+    let mpl: string
+    let source: Record<string, unknown>
+    if (primitiveName) {
+      const requested = args.params && typeof args.params === "object" ? (args.params as Record<string, unknown>) : {}
+      const params: Record<string, number> = {}
+      for (const [k, v] of Object.entries(requested)) {
+        const n = Number(v)
+        if (Number.isFinite(n)) params[k] = n
+      }
+      const targetDuration = typeof args.targetDuration === "number" && args.targetDuration > 0 ? args.targetDuration : undefined
+      const seg = expandLexiconSegment(primitiveName, params, args.mirror === true, targetDuration)
+      if (!seg) throw new Error(`unknown lexicon primitive "${primitiveName}" — call inspect_pmx for the lexicon list`)
+      mpl = ensureCompilableMpl(seg.fragment)
+      source = { kind: "lexicon", primitive: seg.name, durationSec: seg.duration, requestedParams: params, effectiveParams: seg.params, mirror: args.mirror === true, targetDuration }
+    } else {
+      mpl = ensureCompilableMpl(rawMpl)
+      source = { kind: "mpl", chars: rawMpl.length }
+    }
+
+    const res = compileMPL2(compiler, mpl, bones)
+    if (res.vmd.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: stringifyReport({
+              ok: false,
+              source,
+              directiveErrors: res.directiveErrors,
+              warnings: res.warnings,
+              error: "Compiler produced 0 bytes (syntax error, unknown bone/action/direction, or missing @pose/@animation)",
+            }),
+          },
+        ],
+      }
+    }
+
+    // 2) 成品管线（增强 + 贴地烘焙）—— 与舞台播放、export_motion final、compile_and_inspect_mpl2 同源
+    const audit = auditVmd(res.vmd, bones)
+    const fin = finalizeMotion(audit.vmd, bones, { mplSource: mpl, enhanceOptions: { autoBlink: true } })
+    const finalVmd = fin.vmd
+    const keys = readVmdBoneKeys(finalVmd) ?? []
+    const maxFrame = keys.reduce((m, k) => Math.max(m, k.frame), 0)
+    const durationSec = Number((maxFrame / 30).toFixed(2))
+    const timeline = [{ index: 0, start: 0, end: durationSec }]
+    const critic = critiquePoseVmd(bones, finalVmd, mpl, timeline)
+    const criticRaw = critiquePoseVmd(bones, res.vmd, mpl, timeline)
+    const ground = groundReport(fin)
+
+    // 3) 逐帧曲线 + 作者时间轴判定帧的 3D 坐标（带姿势名）
+    const curves = motionCurves(bones, finalVmd, measureGroundErrorVmd(finalVmd, bones))
+    const timelineRefs = parsePoseTextsAndTimeline(mpl).frames
+    const entryRefs = timelineRefs.slice(0, 40)
+    // 作者时间轴的时长（最后一个条目）；成片时长 durationSec 可能因增强器的收尾键略长
+    const authoredSec = Number(((timelineRefs.at(-1)?.frame ?? maxFrame) / 30).toFixed(2))
+    // 判定帧表：每个时间轴条目一行的标量遥测（姿势名 + 髋/脚指标）；完整 3D 坐标按 sampleTimes 另取
+    const entryCoords = extractKeyframeCoords(bones, finalVmd, entryRefs.map((e) => e.frame / 30))
+    const coordsByFrame = new Map(entryCoords.map((c) => [c.frame, c]))
+    const keyframes = entryRefs.flatMap((e) => {
+      const c = coordsByFrame.get(e.frame)
+      return c
+        ? [
+            {
+              frame: c.frame,
+              t: c.timeSec,
+              pose: e.refs.join(","),
+              hipDrop: c.hipDrop,
+              hipBackShift: c.hipBackShift,
+              footLiftL: c.footLiftL,
+              footLiftR: c.footLiftR,
+              squatDepthRatio: c.squatDepthRatio,
+              armExtL: c.armExtensionRatioL,
+              armExtR: c.armExtensionRatioR,
+            },
+          ]
+        : []
+    })
+    const sampleTimes = Array.isArray(args.sampleTimes) ? (args.sampleTimes as unknown[]).map(Number).filter((t) => Number.isFinite(t)) : []
+    const coords = sampleTimes.length > 0 ? extractKeyframeCoords(bones, finalVmd, sampleTimes) : undefined
+    const warnings = buildBiomechanicalWarnings(mpl, res.warnings, extractKeyframeCoords(bones, finalVmd), bones)
+
+    // 4) 分镜（≥1.5s 用 storyboard，否则三视图）
+    let image: { base64: string; width: number; height: number } | null = null
+    let storyboard: Record<string, unknown> | undefined
+    if (args.storyboard !== false) {
+      if (durationSec >= 1.5) {
+        const maxTiles = typeof args.maxTiles === "number" ? Math.max(2, Math.min(8, args.maxTiles)) : 6
+        const sb = renderStoryboardPng(
+          bones,
+          finalVmd,
+          [{ index: 0, start: 0, end: durationSec, action: String(source.primitive ?? source.kind), source: "llm" }],
+          { maxTiles }
+        )
+        if (sb) {
+          image = { base64: sb.dataUrl.replace(/^data:image\/png;base64,/, ""), width: sb.width, height: sb.height }
+          storyboard = { kind: "storyboard", tilesSec: sb.tiles.map((t) => Number(t.timeSec.toFixed(2))), width: sb.width, height: sb.height }
+        }
+      } else {
+        const single = renderPoseMultiViewPng(bones, finalVmd)
+        if (single) {
+          image = { base64: single.dataUrl.replace(/^data:image\/png;base64,/, ""), width: single.width, height: single.height }
+          storyboard = { kind: "views", views: ["front", "side", "top"], frame: single.frame, t: Number(single.timeSec.toFixed(2)), width: single.width, height: single.height }
+        }
+      }
+    }
+
+    // 5) 落盘：<base>.mpl / .vmd / .png（.json 在报告生成后写）
+    const writtenFiles: string[] = []
+    let vmdPath: string | null = null
+    let pngPath: string | null = null
+    let jsonPath: string | null = null
+    if (typeof args.outBasePath === "string" && args.outBasePath.trim()) {
+      const base = path.resolve(ROOT_DIR, args.outBasePath.trim())
+      fs.mkdirSync(path.dirname(base), { recursive: true })
+      fs.writeFileSync(`${base}.mpl`, mpl, "utf8")
+      fs.writeFileSync(`${base}.vmd`, finalVmd)
+      vmdPath = `${base}.vmd`
+      writtenFiles.push(`${base}.mpl`, vmdPath)
+      if (image) {
+        pngPath = `${base}.png`
+        fs.writeFileSync(pngPath, Buffer.from(image.base64, "base64"))
+        writtenFiles.push(pngPath)
+      }
+      jsonPath = `${base}.json`
+      writtenFiles.push(jsonPath)
+    }
+
+    // 6) 闸门：指令错误或成品 critic 未过 → ok=false（force=true 时仍返回报告；否则作为 MCP 错误返回，附分镜便于定位）
+    const gatePassed = res.directiveErrors.length === 0 && (critic?.passed ?? true)
+    const forced = !gatePassed && args.force === true
+    const allIssues = critic?.issues ?? []
+    const issues = allIssues.slice(0, 12).map(({ code, frame, frameEnd, frameCount, severity, message, fixHint }) => ({
+      code,
+      frame,
+      frameEnd,
+      frameCount,
+      severity,
+      message,
+      fixHint,
+    }))
+
+    let stagePush: unknown
+    if (args.pushToStage === true) {
+      if (gatePassed || forced) {
+        stagePush = await pushMotionToStage(args, {
+          mpl,
+          vmdBase64: Buffer.from(finalVmd).toString("base64"),
+          baseRotated: Boolean(res.baseRotated),
+          legsKeyed: Boolean(res.legsKeyed),
+          title: typeof args.title === "string" ? args.title : String(source.primitive ?? "make_motion"),
+        })
+      } else {
+        stagePush = { ok: false, skipped: true, reason: "quality gate failed — pass force=true to push anyway" }
+      }
+    }
+
+    const report = {
+      ok: gatePassed,
+      forced: forced || undefined,
+      source,
+      modelId: entry.id,
+      durationSec,
+      authoredSec,
+      frames: maxFrame + 1,
+      fps: 30,
+      vmd: {
+        bytes: finalVmd.length,
+        sha256: crypto.createHash("sha256").update(finalVmd).digest("hex"),
+        boneKeys: keys.length,
+        rawBoneKeys: (readVmdBoneKeys(res.vmd) ?? []).length,
+        path: vmdPath,
+        base64: args.includeVmdBase64 === true ? Buffer.from(finalVmd).toString("base64") : undefined,
+      },
+      pipeline: { enhanced: fin.enhanced, baked: fin.baked, groundBake: ground.bake },
+      verdict: {
+        passed: gatePassed,
+        critic: { passed: critic?.passed ?? true, summary: critic?.summary ?? "n/a", issueCount: allIssues.length, issues },
+        // raw 编译产物的 critic 只在它失败时附上，并说明成品是否已把它修掉：
+        // 深蹲等动作的原始键在关键帧之间必然沉地（ground_penetration）→ fixedByFinalize=true；
+        // 成品也没修掉的才是作者姿势本身的问题。
+        criticRaw:
+          criticRaw && !criticRaw.passed
+            ? { passed: false, summary: criticRaw.summary, issueCount: criticRaw.issues.length, fixedByFinalize: gatePassed }
+            : undefined,
+        groundContact: ground.ground,
+        groundNotes: ground.notes,
+        actionableWarnings: warnings,
+        directiveErrors: res.directiveErrors,
+        compilerWarnings: res.warnings.slice(0, 12),
+        collisions: { count: res.collisions.length, first: res.collisions.slice(0, 6) },
+        audit: { checkedFrames: audit.checkedFrames, violations: audit.violations.length, fixed: audit.fixed.length, unresolved: audit.unresolved.length },
+      },
+      curves,
+      keyframes,
+      coords,
+      storyboard: storyboard ? { ...storyboard, path: pngPath } : undefined,
+      writtenFiles,
+      stagePush,
+    }
+    const text = stringifyReport(report)
+    if (jsonPath) fs.writeFileSync(jsonPath, text, "utf8")
+    const content: { type: "image" | "text"; data?: string; mimeType?: string; text?: string }[] = []
+    if (image) content.push({ type: "image", data: image.base64, mimeType: "image/png" })
+    content.push({ type: "text", text })
+    return gatePassed || forced ? { content } : { isError: true, content }
   }
 
   if (name === "inspect_vmd_file") {

@@ -946,7 +946,7 @@ export function fragmentDuration(fragment: string): number {
   return f2(max)
 }
 
-/** 用词库展开一个分段（clamp 参数 → 按目标时长自适应 cycles/hold → build → 可选镜像），返回片段与时长 */
+/** 用词库展开一个分段（clamp 参数 → 按目标时长自适应 cycles/hold → build → 可选镜像），返回片段、时长与实际生效的参数（clamp / 自适应之后） */
 export function expandLexiconSegment(
   action: string,
   params?: Record<string, number>,
@@ -984,7 +984,7 @@ export function expandLexiconSegment(
     // 姿势语句镜像，动画帧不动（引用的姿势名不变）
     fragment = mirrorPoseBlocksFragment(fragment)
   }
-  return { fragment, duration: dur, name: prim.name }
+  return { fragment, duration: dur, name: prim.name, params: { ...clamped } }
 }
 
 // 行级左右镜像（与 mpl-macros.mirrorStatementLine 同逻辑；刻意内联以保持本文件零运行时依赖，

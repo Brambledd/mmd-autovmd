@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import { spawn } from "node:child_process"
 import path from "node:path"
@@ -7,6 +8,14 @@ import { readVmdBoneKeys } from "../src/lib/fk.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(__dirname, "..")
+
+// 统计通过的检查数（每条 "  ok  ..." 输出算一项），结尾的汇总以实际计数为准
+let okCount = 0
+const rawLog = console.log
+console.log = (...a) => {
+  if (String(a[0]).trimStart().startsWith("ok ")) okCount++
+  rawLog(...a)
+}
 
 const child = spawn(process.execPath, [path.join(root, "src/mcp/popo-mcp-server.ts")], {
   cwd: root,
@@ -57,6 +66,7 @@ try {
   const listed = await rpc("tools/list", {})
   const names = listed.tools.map((t) => t.name)
   assert.deepEqual(names, [
+    "make_motion",
     "list_models",
     "inspect_pmx",
     "compile_and_inspect_mpl2",
@@ -65,7 +75,11 @@ try {
     "inspect_vmd_file",
     "push_vmd_to_stage",
   ])
-  console.log("  ok  tools/list (7 tools)")
+  for (const t of listed.tools) {
+    assert(t.description && t.description.length > 20, `${t.name} needs a description`)
+    assert.equal(t.inputSchema.type, "object", `${t.name} schema must be an object`)
+  }
+  console.log("  ok  tools/list (8 tools, make_motion first)")
 
   const modelsRes = await rpc("tools/call", { name: "list_models", arguments: {} })
   const models = JSON.parse(modelsRes.content[0].text)
@@ -300,8 +314,181 @@ main {
     console.log("  ok  push_vmd_to_stage blocks broken external VMD")
   }
 
+  // ---- make_motion: 一次调用 = 编译 → 成品管线 → 闸门 → 分镜 → 报告（词库原语）
+  const mkBase = ".tmp/test-make/squat-default"
+  const mkRes = await rpc("tools/call", {
+    name: "make_motion",
+    arguments: { primitive: "squat", outBasePath: mkBase, title: "squat default", sampleTimes: [1.2, 9.06] },
+  })
+  assert.equal(mkRes.isError, undefined, JSON.stringify(mkRes).slice(0, 600))
+  assert.equal(mkRes.content[0].type, "image", "storyboard PNG must come first")
+  assert.equal(mkRes.content[0].mimeType, "image/png")
+  const mkText = mkRes.content[1].text
+  const mk = JSON.parse(mkText)
+  assert.equal(mk.ok, true, mkText.slice(0, 1500))
+  assert.equal(mk.source.kind, "lexicon")
+  assert.equal(mk.source.primitive, "squat")
+  assert.deepEqual(mk.source.requestedParams, {})
+  assert.equal(mk.source.effectiveParams.depth, 1)
+  assert.equal(mk.source.effectiveParams.cycles, 3)
+  assert.equal(mk.modelId, "topaz")
+  // 成片 = 作者时间轴 + 增强器的收尾键：词库时长 9.05s → 作者末帧 f271 = 9.03s（帧量化）→ 成片末帧 f278 = 9.27s
+  assert.equal(mk.source.durationSec, 9.05)
+  assert.equal(mk.authoredSec, 9.03)
+  assert.equal(mk.durationSec, 9.27)
+  assert.equal(mk.frames, 279)
+  assert.match(mk.vmd.sha256, /^[0-9a-f]{64}$/)
+  assert.equal(mk.vmd.base64, undefined, "bytes stay out of the report unless includeVmdBase64")
+  assert.equal(mk.pipeline.enhanced, true)
+  assert.equal(mk.pipeline.baked, true)
+  assert(mk.pipeline.groundBake.insertedKeys > 0)
+  assert(mk.vmd.boneKeys > mk.vmd.rawBoneKeys, "final = enhanced + baked")
+  // 结论：与 export_motion final / compile_and_inspect_mpl2 同一口径
+  assert.equal(mk.verdict.passed, true)
+  assert.deepEqual(mk.verdict.directiveErrors, [])
+  assert.equal(mk.verdict.critic.passed, true)
+  assert.equal(mk.verdict.critic.issueCount, 0)
+  // 原始编译在关键帧之间沉地（ground_penetration）是预期——报告附上并标明成品已修掉
+  assert.equal(mk.verdict.criticRaw.passed, false, "raw compile sinks between keys")
+  assert.equal(mk.verdict.criticRaw.fixedByFinalize, true, "…and the final motion fixes it")
+  assert.match(mk.verdict.criticRaw.summary, /ground_penetration/)
+  assert.equal(mk.verdict.groundContact.offendingFrames, 0)
+  // 管线默认容差 0.05u（4mm），不松于 5mm（0.0625u）的回归阈值
+  assert(mk.verdict.groundContact.tolerance > 0 && mk.verdict.groundContact.tolerance <= 0.0625, `tolerance ${mk.verdict.groundContact.tolerance}`)
+  assert.equal(mk.pipeline.groundBake.residualFrames, 0)
+  // 逐帧曲线：脚底偏移全在容差内、髋降峰值、时间单调、末帧必采
+  const c = mk.curves
+  assert(c && c.stride >= 1, "curves missing")
+  for (const k of ["footL", "footR", "footLiftL", "footLiftR", "hipDrop"]) assert.equal(c[k].length, c.t.length, `${k} length`)
+  assert(c.t.every((t, i) => i === 0 || t > c.t[i - 1]), "curve time must increase")
+  assert.equal(c.t[0], 0)
+  assert.equal(c.t.at(-1), 9.267, "last frame must be sampled")
+  assert.equal(c.tolerance, mk.verdict.groundContact.tolerance, "curves use the same tolerance as the verdict")
+  assert(c.footL.concat(c.footR).every((v) => Math.abs(v) <= c.tolerance), "every sampled sole offset within tolerance")
+  assert(Math.abs(c.peaks.hipDropMax.value - 5.71) < 0.02, `hip drop peak ${c.peaks.hipDropMax.value}`)
+  assert(c.peaks.footLiftMaxL.value < 0.1 && c.peaks.footLiftMaxR.value < 0.1, "squat keeps both feet down")
+  // 判定帧表：每个时间轴条目一行（姿势名 + 标量遥测），第一个触底帧髋降量与曲线峰值一致
+  assert.equal(mk.keyframes.length, 27, "all 27 timeline entries (3 reps × 9) are reported")
+  assert.equal(mk.keyframes[0].pose, "sq_top")
+  assert.equal(mk.keyframes[0].frame, 0)
+  assert.equal(mk.keyframes[0].t, 0)
+  assert.equal(mk.keyframes[3].pose, "sq_bottom")
+  assert.equal(mk.keyframes[3].frame, 36)
+  assert.equal(mk.keyframes[3].t, 1.2)
+  assert(Math.abs(mk.keyframes[3].hipDrop - c.peaks.hipDropMax.value) < 0.02)
+  assert.equal(mk.keyframes[3].footLiftL, mk.keyframes[3].footLiftR, "symmetric squat")
+  assert(mk.keyframes[3].squatDepthRatio > 0.5 && mk.keyframes[3].armExtL < 0.8)
+  // 完整 3D 坐标按 sampleTimes 另取
+  assert.equal(mk.coords.length, 2)
+  assert.equal(mk.coords[0].frame, 36)
+  assert.equal(mk.coords[1].timeSec, 9.03)
+  assert(Math.abs(mk.coords[0].center.y - (8 - c.peaks.hipDropMax.value)) < 0.02, `centre y ${mk.coords[0].center.y}`)
+  assert(Math.abs(mk.coords[0].ankleL.y - mk.verdict.groundContact.restAnkleY.l) < 0.01, "ankle stays at rest height at the bottom")
+  assert(mk.coords[1].hipDrop < 0.2, `standing again at the last authored frame: hipDrop ${mk.coords[1].hipDrop}`)
+  assert.equal(mk.storyboard.kind, "storyboard")
+  assert.equal(mk.storyboard.tilesSec.length, 6)
+  assert.equal(mk.stagePush, undefined, "no push unless asked")
+  // 落盘：.mpl / .vmd / .png / .json，且 .vmd 的字节数与 sha256 与报告一致
+  assert.equal(mk.writtenFiles.length, 4, JSON.stringify(mk.writtenFiles))
+  for (const ext of [".mpl", ".vmd", ".png", ".json"]) assert(fs.existsSync(path.join(root, mkBase + ext)), `missing ${ext}`)
+  const mkVmd = fs.readFileSync(path.join(root, mkBase + ".vmd"))
+  assert.equal(mkVmd.length, mk.vmd.bytes)
+  assert.equal(crypto.createHash("sha256").update(mkVmd).digest("hex"), mk.vmd.sha256)
+  assert.equal(mk.vmd.path, path.join(root, mkBase + ".vmd"))
+  const mkPng = fs.readFileSync(path.join(root, mkBase + ".png"))
+  assert(mkPng.length > 500 && mkPng[0] === 0x89 && mkPng[1] === 0x50, "written PNG must be a real PNG")
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, mkBase + ".json"), "utf8")).vmd.sha256, mk.vmd.sha256)
+  assert.match(fs.readFileSync(path.join(root, mkBase + ".mpl"), "utf8"), /main\s*\{/, "expanded MPL is saved compilable")
+  // 报告排版省 token：曲线数组单行、判定帧表每项一行、嵌套对象仍缩进；整份报告保持在 ~12KB 量级
+  assert(mkText.includes('"footL": [') && mkText.includes('"vmd": {"bytes"'), "inline number arrays / flat objects")
+  assert.equal((mkText.match(/^\s+\{"frame":\d+,"t":[\d.]+,"pose":"/gm) ?? []).length, 27, "one line per timeline entry")
+  assert(mkText.split("\n").length < 250 && mkText.length < 16000, `report too verbose: ${mkText.length} chars / ${mkText.split("\n").length} lines`)
+  console.log(
+    `  ok  make_motion (lexicon squat: ${mk.frames}f ${mk.durationSec}s, vmd ${mk.vmd.bytes}B sha ${mk.vmd.sha256.slice(0, 8)}, ` +
+      `+${mk.pipeline.groundBake.insertedKeys} bake keys, hip drop ${c.peaks.hipDropMax.value}u, ${mk.storyboard.tilesSec.length} tiles, 4 files)`
+  )
+
+  // 参数：越界钳制、未知参数忽略、目标时长加循环、深度生效、镜像
+  const halfRes = await rpc("tools/call", {
+    name: "make_motion",
+    arguments: { primitive: "squat", params: { depth: 0.5, tempo: 99, bogus: 1 }, targetDuration: 20, mirror: true, maxTiles: 4 },
+  })
+  const half = JSON.parse(halfRes.content[1].text)
+  assert.equal(half.ok, true, halfRes.content[1].text.slice(0, 1500))
+  assert.equal(half.source.effectiveParams.depth, 0.5)
+  assert.equal(half.source.effectiveParams.tempo, 1.6, "out-of-range params are clamped")
+  assert.equal(half.source.effectiveParams.bogus, undefined, "unknown params are ignored")
+  assert.equal(half.source.effectiveParams.cycles, 6, "targetDuration adds cycles up to the primitive max")
+  assert.equal(half.source.mirror, true)
+  assert.equal(half.source.targetDuration, 20)
+  assert(half.durationSec > 10 && half.durationSec < 13, `duration ${half.durationSec}`)
+  assert.equal(half.verdict.groundContact.offendingFrames, 0)
+  assert.equal(half.storyboard.tilesSec.length, 4, "maxTiles is honoured")
+  assert(half.curves.peaks.hipDropMax.value < c.peaks.hipDropMax.value - 3, `half squat must be shallower: ${half.curves.peaks.hipDropMax.value}`)
+  console.log(
+    `  ok  make_motion params (depth 0.5 → hip drop ${half.curves.peaks.hipDropMax.value}u, tempo clamped 1.6, cycles 3→6 for 20s, ${half.durationSec}s, mirrored)`
+  )
+
+  // 直接给 MPL：<1.5s 的短动作返回三视图而不是分镜
+  const shortMpl = `@pose p {\n  reach hand_r to wave_r;\n  hand_r open;\n  face にこり 0.7;\n}\n@animation a {\n  0: p;\n  1: p;\n}`
+  const shortRes = await rpc("tools/call", { name: "make_motion", arguments: { mpl: shortMpl, modelId: "topaz", storyboard: true } })
+  assert.equal(shortRes.isError, undefined)
+  const short = JSON.parse(shortRes.content[1].text)
+  assert.equal(short.source.kind, "mpl")
+  assert.equal(short.ok, true, shortRes.content[1].text.slice(0, 1500))
+  assert.equal(short.authoredSec, 1, "last authored entry at 1.0s")
+  assert.equal(short.frames, 35, "1.0s clip + enhancer tail keys (f34)")
+  assert.equal(short.durationSec, 1.13)
+  assert.equal(short.storyboard.kind, "views")
+  assert.equal(short.keyframes[0].pose, "p")
+  const noSb = JSON.parse((await rpc("tools/call", { name: "make_motion", arguments: { mpl: shortMpl, storyboard: false } })).content[0].text)
+  assert.equal(noSb.storyboard, undefined, "storyboard:false → text only")
+  console.log(`  ok  make_motion mpl input (1.0s → 3-view PNG; storyboard:false → text only)`)
+
+  // 闸门：作者姿势本身沉地（直腿 + 重心下移 4u，没有可修的过渡段）→ 报告作为 MCP 错误返回（仍带分镜与完整诊断）；force=true 则正常返回 ok=false
+  const brokenMpl = `@pose sink {\n    center move down 4;\n    leg_l reset;\n    leg_r reset;\n    knee_l reset;\n    knee_r reset;\n}\n@animation a {\n    0: sink;\n    2: sink;\n}\nmain {\n    a;\n}`
+  const blockedRes = await rpc("tools/call", { name: "make_motion", arguments: { mpl: brokenMpl, pushToStage: true } })
+  assert.equal(blockedRes.isError, true, "failed gate must surface as an MCP error")
+  assert.equal(blockedRes.content[0].type, "image", "diagnostics still carry the storyboard")
+  const blocked = JSON.parse(blockedRes.content[1].text)
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.verdict.passed, false)
+  assert.equal(blocked.verdict.critic.passed, false)
+  assert(blocked.verdict.critic.issues.length > 0 && blocked.verdict.critic.issueCount >= blocked.verdict.critic.issues.length)
+  assert.equal(blocked.verdict.critic.issues[0].code, "ground_penetration")
+  assert.equal(blocked.verdict.groundContact.offendingFrames, 122, "61 frames × 2 feet sunk 4u — authored, reported as-is")
+  assert.equal(blocked.pipeline.groundBake.insertedKeys, 0, "held key poses are never rewritten")
+  assert.equal(blocked.curves.peaks.footDeepestL.value, -4)
+  assert.equal(blocked.curves.peaks.hipDropMax.value, 4)
+  assert(
+    blocked.verdict.groundNotes.some((n) => n.includes("authored pose")),
+    `expected an authored-pose hint, got ${JSON.stringify(blocked.verdict.groundNotes)}`
+  )
+  assert.deepEqual(blocked.verdict.directiveErrors, [])
+  assert.match(blocked.vmd.sha256, /^[0-9a-f]{64}$/)
+  assert.equal(blocked.stagePush.ok, false, "a failed gate never reaches the stage")
+  const forcedRes = await rpc("tools/call", { name: "make_motion", arguments: { mpl: brokenMpl, force: true, includeVmdBase64: true } })
+  assert.equal(forcedRes.isError, undefined, "force=true returns the report instead of an error")
+  const forced = JSON.parse(forcedRes.content[1].text)
+  assert.equal(forced.ok, false)
+  assert.equal(forced.forced, true)
+  assert.equal(forced.vmd.bytes, Buffer.from(forced.vmd.base64, "base64").length, "includeVmdBase64 embeds the exact final bytes")
+  console.log(
+    `  ok  make_motion quality gate (authored sink: ${blocked.verdict.groundContact.offendingFrames} offending foot-frames, ` +
+      `${blocked.verdict.critic.issueCount} issue(s) e.g. ${blocked.verdict.critic.issues[0].code}; isError + no push; force returns report)`
+  )
+
+  const unknownRes = await rpc("tools/call", { name: "make_motion", arguments: { primitive: "moonwalk" } })
+  assert.equal(unknownRes.isError, true)
+  assert.match(unknownRes.content[0].text, /unknown lexicon primitive "moonwalk"/)
+  const neitherRes = await rpc("tools/call", { name: "make_motion", arguments: { modelId: "topaz" } })
+  assert.equal(neitherRes.isError, true)
+  assert.match(neitherRes.content[0].text, /mpl.*primitive/)
+  console.log(`  ok  make_motion input validation (unknown primitive / neither mpl nor primitive → error)`)
+
   fs.rmSync(path.join(root, ".tmp/test-handoff"), { recursive: true, force: true })
-  console.log("\n10 MCP server tests passed.")
+  fs.rmSync(path.join(root, ".tmp/test-make"), { recursive: true, force: true })
+  rawLog(`\n${okCount} MCP server tests passed.`)
 } finally {
   child.kill()
 }
