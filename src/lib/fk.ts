@@ -25,7 +25,7 @@ export interface Vec3 { x: number; y: number; z: number }
 
 const qIdentity = (): Quat => ({ x: 0, y: 0, z: 0, w: 1 })
 
-function qMul(a: Quat, b: Quat): Quat {
+export function qMul(a: Quat, b: Quat): Quat {
   return {
     x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
     y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
@@ -39,7 +39,7 @@ function qNormalize(q: Quat): Quat {
   return { x: q.x / l, y: q.y / l, z: q.z / l, w: q.w / l }
 }
 
-function qConjugate(q: Quat): Quat {
+export function qConjugate(q: Quat): Quat {
   return { x: -q.x, y: -q.y, z: -q.z, w: q.w }
 }
 
@@ -63,6 +63,13 @@ export interface VmdBoneKey {
   /** VMD 位移（センター等 movable 骨骼才有意义，世界系相对绑定位置） */
   pos: [number, number, number]
   quat: [number, number, number, number] // x,y,z,w
+  /**
+   * 该关键帧的 64 字节 VMD 插值表（4 通道 × 16 字节：X/Y/Z 平移 + 旋转）。
+   * 文件读出的关键帧必带；手工构造的可省略（采样时按 MMD 默认曲线 20,20,107,107 处理）。
+   */
+  interp?: Uint8Array
+  /** 原始 15 字节骨名（Shift_JIS，补 0）；回写 VMD 时原样使用。 */
+  raw?: Uint8Array
 }
 
 /** 读取 VMD 全部骨骼关键帧（15B 名 + 帧号 + 位移 + 四元数 + 64B 插值 = 111B/条）。 */
@@ -87,6 +94,8 @@ export function readVmdBoneKeys(vmd: Uint8Array): VmdBoneKey[] | null {
         frame,
         pos: [dv.getFloat32(o + 19, true), dv.getFloat32(o + 23, true), dv.getFloat32(o + 27, true)],
         quat: [dv.getFloat32(o + 31, true), dv.getFloat32(o + 35, true), dv.getFloat32(o + 39, true), dv.getFloat32(o + 43, true)],
+        interp: vmd.slice(o + 47, o + 111),
+        raw: vmd.slice(o, o + 15),
       })
       o += 111
     }
@@ -183,6 +192,175 @@ export function solveFrameWorld(
   return solveFrameTransforms(bones, keysByJp, semantics)?.pos ?? null
 }
 
+// ---------------------------------------------------------------- 连续求值（与舞台引擎同源）
+
+/**
+ * 关键帧之间怎么走，由播放引擎决定。舞台用的 reze-engine（dist/model.js `getPoseAtTime`）约定：
+ *   - 每根骨骼一条轨道，取「最后一个 time ≤ t」的键为 A、其后一键为 B；
+ *   - **插值表取 B（后一键）的**，不是 MMD/Blender 约定的「起始键描述它之后的一段」；
+ *   - 旋转权重 rotT = bezier(interp[0], interp[1], interp[2], interp[3])——读的是 X 平移通道的
+ *     前 4 字节（含 3 个填充字节），真正的旋转通道（第 48–63 字节）被忽略；
+ *   - 平移按通道 bezier：X 用 [0,8,4,12]、Y 用 [16,24,20,28]、Z 用 [32,40,36,44]；
+ *   - 旋转 Quat.slerp(A, B, rotT)，平移 A + (B−A)·weight；末键之后直接保持。
+ * 下面的采样器逐式照搬这套规则，所以 Node 端算出的就是舞台正在播的 FK 坐标；
+ * 步进保持（step-hold，只看 ≤f 的最近键）会把帧间的下沉/过冲全部漏掉。
+ */
+
+/** reze-engine dist/math.js `bezierInterpolate` 的逐式复刻（二分 15 次）。 */
+export function vmdBezierInterpolate(x1: number, x2: number, y1: number, y2: number, t: number): number {
+  t = Math.max(0, Math.min(1, t))
+  let start = 0
+  let end = 1
+  let mid = 0.5
+  for (let i = 0; i < 15; i++) {
+    const x = 3 * (1 - mid) * (1 - mid) * mid * x1 + 3 * (1 - mid) * mid * mid * x2 + mid * mid * mid
+    if (Math.abs(x - t) < 0.0001) break
+    if (x < t) start = mid
+    else end = mid
+    mid = (start + end) / 2
+  }
+  return 3 * (1 - mid) * (1 - mid) * mid * y1 + 3 * (1 - mid) * mid * mid * y2 + mid * mid * mid
+}
+
+/** reze-engine `Quat.slerp` 的逐式复刻（cos<0 走短弧；cos>0.9995 走归一化线性）。 */
+export function vmdQuatSlerp(a: Quat, b: Quat, t: number): Quat {
+  let cos = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+  let bx = b.x, by = b.y, bz = b.z, bw = b.w
+  if (cos < 0) {
+    cos = -cos
+    bx = -bx
+    by = -by
+    bz = -bz
+    bw = -bw
+  }
+  if (cos > 0.9995) {
+    const x = a.x + t * (bx - a.x)
+    const y = a.y + t * (by - a.y)
+    const z = a.z + t * (bz - a.z)
+    const w = a.w + t * (bw - a.w)
+    const invLen = 1 / Math.hypot(x, y, z, w)
+    return { x: x * invLen, y: y * invLen, z: z * invLen, w: w * invLen }
+  }
+  const theta0 = Math.acos(cos)
+  const sinTheta0 = Math.sin(theta0)
+  const theta = theta0 * t
+  const s0 = Math.sin(theta0 - theta) / sinTheta0
+  const s1 = Math.sin(theta) / sinTheta0
+  return { x: s0 * a.x + s1 * bx, y: s0 * a.y + s1 * by, z: s0 * a.z + s1 * bz, w: s0 * a.w + s1 * bw }
+}
+
+/** MMD 默认插值表（每通道 20,20,107,107；布局与 vmd-enhancer `interpBytes` 一致）。 */
+const DEFAULT_INTERP = (() => {
+  const b = new Uint8Array(64)
+  for (let ch = 0; ch < 4; ch++) {
+    b[ch * 16] = 20
+    b[ch * 16 + 4] = 20
+    b[ch * 16 + 8] = 107
+    b[ch * 16 + 12] = 107
+  }
+  return b
+})()
+
+/** 每根骨骼一条按帧号升序的关键帧轨道。 */
+export type BoneTracks = Map<string, VmdBoneKey[]>
+
+export function buildBoneTracks(keys: readonly VmdBoneKey[]): BoneTracks {
+  const tracks: BoneTracks = new Map()
+  for (const k of keys) {
+    const list = tracks.get(k.jp)
+    if (list) list.push(k)
+    else tracks.set(k.jp, [k])
+  }
+  // 稳定排序：同帧同骨的多条键保持文件顺序（与引擎一致）
+  for (const list of tracks.values()) {
+    let sorted = true
+    for (let i = 1; i < list.length; i++) {
+      if (list[i - 1].frame > list[i].frame) { sorted = false; break }
+    }
+    if (!sorted) list.sort((a, b) => a.frame - b.frame)
+  }
+  return tracks
+}
+
+/** 最后一个 frame ≤ t 的键下标（无则 −1）。 */
+function lastIndexAtOrBefore(keys: VmdBoneKey[], t: number): number {
+  let lo = 0
+  let hi = keys.length - 1
+  let ans = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (keys[mid].frame <= t) { ans = mid; lo = mid + 1 } else hi = mid - 1
+  }
+  return ans
+}
+
+/**
+ * 按引擎规则采样单条轨道在（可含小数的）帧 t 处的姿态，返回可直接喂给
+ * solveFrameTransforms 的关键帧对象（pos 已含插值结果）。
+ */
+export function sampleBoneTrack(keys: VmdBoneKey[], t: number, jp?: string): VmdBoneKey {
+  const first = keys[0]
+  const last = keys[keys.length - 1]
+  const name = jp ?? first.jp
+  const clamped = Math.max(first.frame, Math.min(last.frame, t))
+  const idx = lastIndexAtOrBefore(keys, clamped)
+  const a = idx >= 0 ? keys[idx] : first
+  const b = idx >= 0 && idx + 1 < keys.length ? keys[idx + 1] : undefined
+  if (!b || b.frame === a.frame) {
+    return { jp: name, frame: clamped, pos: [a.pos[0], a.pos[1], a.pos[2]], quat: [a.quat[0], a.quat[1], a.quat[2], a.quat[3]] }
+  }
+  const gradient = (clamped - a.frame) / (b.frame - a.frame)
+  const interp = b.interp ?? DEFAULT_INTERP
+  const INV = 1 / 127
+  const rotT = vmdBezierInterpolate(interp[0] * INV, interp[1] * INV, interp[2] * INV, interp[3] * INV, gradient)
+  const q = vmdQuatSlerp(
+    { x: a.quat[0], y: a.quat[1], z: a.quat[2], w: a.quat[3] },
+    { x: b.quat[0], y: b.quat[1], z: b.quat[2], w: b.quat[3] },
+    rotT
+  )
+  const wAt = (offset: number) =>
+    vmdBezierInterpolate(interp[offset] * INV, interp[offset + 8] * INV, interp[offset + 4] * INV, interp[offset + 12] * INV, gradient)
+  const wx = wAt(0)
+  const wy = wAt(16)
+  const wz = wAt(32)
+  return {
+    jp: name,
+    frame: clamped,
+    pos: [
+      a.pos[0] + (b.pos[0] - a.pos[0]) * wx,
+      a.pos[1] + (b.pos[1] - a.pos[1]) * wy,
+      a.pos[2] + (b.pos[2] - a.pos[2]) * wz,
+    ],
+    quat: [q.x, q.y, q.z, q.w],
+  }
+}
+
+/** 采样全部轨道，得到 t 帧的「每骨一键」状态（插值后的关键帧）。 */
+export function sampleBoneTracks(tracks: BoneTracks, t: number): Map<string, VmdBoneKey> {
+  const state = new Map<string, VmdBoneKey>()
+  for (const [jp, keys] of tracks) state.set(jp, sampleBoneTrack(keys, t, jp))
+  return state
+}
+
+/** t 帧的世界坐标 + 世界旋转（连续求值版 solveFrameTransforms）。 */
+export function samplePoseTransforms(
+  bones: PmxBones,
+  tracks: BoneTracks,
+  t: number,
+  semantics: "absolute" | "offset" = detectPosSemantics(bones)
+): FrameTransforms | null {
+  return solveFrameTransforms(bones, sampleBoneTracks(tracks, t), semantics)
+}
+
+/** 整数帧序列 0..maxFrame（舞台 30fps 实际渲染的每一帧）。 */
+export function integerFrames(keys: readonly VmdBoneKey[]): number[] {
+  let max = 0
+  for (const k of keys) if (k.frame > max) max = k.frame
+  const out: number[] = []
+  for (let f = 0; f <= max; f++) out.push(f)
+  return out
+}
+
 // ---------------------------------------------------------------- 地面接触分析
 
 export interface GroundFrameReport {
@@ -215,6 +393,13 @@ export interface AnalyzeOptions {
   terminals?: string[]
   /** 穿地判定阈值（世界 y），默认 -0.5u（≈4cm 容差） */
   penetrationThreshold?: number
+  /**
+   * true = 按舞台引擎规则在帧间插值求值（见 sampleBoneTrack）；默认 step-hold，
+   * 每根骨骼只看 ≤f 的最近关键帧（帧间下沉/过冲会被漏掉）。
+   */
+  interpolated?: boolean
+  /** 要检查的帧号（升序）；缺省 = 全部关键帧。配合 interpolated 可覆盖关键帧之间的每一帧。 */
+  frames?: number[]
 }
 
 /**
@@ -241,8 +426,9 @@ export function analyzeGroundContactKeys(
     const terminals = opts.terminals ?? DEFAULT_TERMINALS
     const threshold = opts.penetrationThreshold ?? -0.5
     const sortedKeys = [...keys].sort((a, b) => a.frame - b.frame)
-    const distinctFrames = [...new Set(sortedKeys.map((k) => k.frame))].sort((a, b) => a - b)
+    const distinctFrames = opts.frames ?? [...new Set(sortedKeys.map((k) => k.frame))].sort((a, b) => a - b)
     const state = new Map<string, VmdBoneKey>()
+    const tracks = opts.interpolated ? buildBoneTracks(keys) : null
     let ki = 0
     const reports: GroundFrameReport[] = []
     let lowest: number | null = null
@@ -252,7 +438,7 @@ export function analyzeGroundContactKeys(
         state.set(sortedKeys[ki].jp, sortedKeys[ki])
         ki++
       }
-      const world = solveFrameWorld(bones, state, semantics)
+      const world = tracks ? samplePoseTransforms(bones, tracks, frame, semantics)?.pos : solveFrameWorld(bones, state, semantics)
       if (!world) return null
       const terminalsY: Record<string, number> = {}
       let frameLowest: number | null = null
