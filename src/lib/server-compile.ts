@@ -22,8 +22,13 @@ let compilerPromise: Promise<WasmMPLCompiler | null> | null = null
 async function loadCompiler(): Promise<WasmMPLCompiler | null> {
   const candidates: string[] = []
   try {
-    candidates.push(join(dirname(fileURLToPath(import.meta.url)), "mmd_mpl_bg.wasm"))
+    const here = dirname(fileURLToPath(import.meta.url))
+    candidates.push(join(here, "mmd_mpl_bg.wasm"))
+    candidates.push(join(here, "..", "..", "node_modules", "mmd-mpl", "mmd_mpl_bg.wasm"))
   } catch { /* import.meta.url 不可用 */ }
+  if (process.env.POPO_ROOT?.trim()) {
+    candidates.push(join(process.env.POPO_ROOT.trim(), "node_modules", "mmd-mpl", "mmd_mpl_bg.wasm"))
+  }
   try {
     candidates.push(join(process.cwd(), "node_modules", "mmd-mpl", "mmd_mpl_bg.wasm"))
   } catch { /* cwd 不可用 */ }

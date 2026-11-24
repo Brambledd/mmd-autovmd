@@ -348,6 +348,9 @@ function resolveReachTarget(
   const env = bones.envelopes ?? {}
   const hipHalfW = env["下半身"] ? Math.max(Math.abs(env["下半身"].min[0]), Math.abs(env["下半身"].max[0])) : 1.81
   const waistHalfW = env["上半身"] ? Math.max(Math.abs(env["上半身"].min[0]), Math.abs(env["上半身"].max[0])) : 1.26
+  const armRestIdx = bones.indexByJp.get("左腕") ?? bones.indexByJp.get("右腕")
+  const restW = armRestIdx != null ? restWorldPositions(bones).get(armRestIdx) : undefined
+  const shoulderHalfW = restW ? Math.max(1.1, Math.abs(restW.x)) : 1.25
   const upper2Idx = bones.indexByJp.get("上半身2") ?? bones.indexByJp.get("上半身")
   const upper2RestZ = upper2Idx != null ? bones.bones[upper2Idx].pos[2] : -0.37
   const chestFrontOff = env["上半身2"] ? env["上半身2"].min[2] - upper2RestZ : -1.63
@@ -406,7 +409,7 @@ function resolveReachTarget(
     poleHint = "side_out"
   } else if (t === "shoulder_l" || t === "shoulder_r" || t === "shoulder") {
     const side = t === "shoulder_l" ? 1 : t === "shoulder_r" ? -1 : s
-    base = hostPoint("上半身2", "上半身", [side * 1.25, 1.95, -0.45])
+    base = hostPoint("上半身2", "上半身", [side * shoulderHalfW, 1.95, -0.45])
     poleHint = "chest_front"
   } else if (t === "knee_l" || t === "knee_r" || t === "knee") {
     const kneeJp = t === "knee_l" ? "左ひざ" : t === "knee_r" ? "右ひざ" : isLeft ? "左ひざ" : "右ひざ"
@@ -428,7 +431,7 @@ function resolveReachTarget(
     poleHint = "back_out"
   } else if (t === "front" || t === "front_l" || t === "front_r") {
     const side = t === "front_l" ? 1 : t === "front_r" ? -1 : s
-    base = hostPoint("上半身2", "上半身", [side * 1.25, 0.5, -4.3])
+    base = hostPoint("上半身2", "上半身", [side * shoulderHalfW, 0.5, -4.3])
     poleHint = "chest_front"
   } else if (t === "up" || t === "up_l" || t === "up_r") {
     const side = t === "up_l" ? 1 : t === "up_r" ? -1 : s

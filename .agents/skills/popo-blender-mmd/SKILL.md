@@ -9,7 +9,7 @@ description: >-
 
 # PoPo + Blender MMD Motion Workflow
 
-Use this skill whenever creating or refining 3D character motions for `.pmx` models across **PoPo MCP (`popo-mmd`)** and **Blender (`blender` MCP server + `mmd_tools`)**. In DSH the tools are called `mcp__popo-mmd__<tool>` (e.g. `mcp__popo-mmd__export_motion`) and `mcp__blender__execute_blender_code`.
+Use this skill whenever creating or refining 3D character motions for `.pmx` models across **PoPo MCP (`popo-mmd`)** and **Blender (`mmd_tools`)**. In Antigravity, call the registered `popo-mmd` MCP tools directly (no `mcp__` prefix needed); in DSH they are named `mcp__popo-mmd__<tool>` and `mcp__blender__execute_blender_code`. For Stage 2 (Blender), use either a connected `blender` MCP server OR run `bpy` scripts directly via `blender -b --python <script.py>` (or open the `.blend` in Blender GUI to inspect).
 
 ## Division of Responsibilities (Single Source of Truth)
 
@@ -54,7 +54,7 @@ Use this skill whenever creating or refining 3D character motions for `.pmx` mod
 
 ## Stage 2 — Blender `mmd_tools` Last-Mile Polish
 
-When interacting with Blender via `mcp__blender__execute_blender_code` (argument `code`: Python executed inside Blender's `bpy`; Blender must be running as a normal GUI process), **strictly follow these `mmd_tools` v4.2+ conventions**:
+When interacting with Blender — either via a Blender MCP tool (`execute_blender_code`) against a running Blender GUI, or by writing a Python script in `.tmp/` and invoking `blender --background --python <script.py>` — **strictly follow these `mmd_tools` v4.2+ conventions**:
 
 ### 1. Import `.pmx` and Blocking `.vmd` (No 5-frame Margin!)
 
@@ -163,7 +163,8 @@ center = pb_j("センター")
 feet = [(pb_j("左足首"), 1), (pb_j("右足首"), -1)]       # (ankle, +1 = character's left = +X)
 chain = [pb_j("腰"), pb_j("左足"), pb_j("右足"), pb_j("左ひざ"), pb_j("右ひざ")] + [pb for pb, _ in feet]
 mats = [m.name if m else "" for m in mesh.data.materials]
-shoe = set(i for i, m in enumerate(mats) if m == "鞋子")
+shoe_kw = ("鞋", "shoe", "boot", "靴", "ヒール", "パンプス")
+shoe = set(i for i, m in enumerate(mats) if any(k in m.lower() for k in shoe_kw))
 VERT, VERT_SIGN = 1, -1.0      # center.location[VERT] += 0.1 lowers the body by 0.1 m (measured)
 PITCH_TOL, HEIGHT_TOL, MAX_ITERS = math.radians(0.6), 0.0025, 4
 pitch_axis = arm.matrix_world.inverted().to_3x3() @ Vector((1.0, 0.0, 0.0))   # world X in armature space
@@ -174,8 +175,12 @@ def soles():
     ev = mesh.evaluated_get(bpy.context.evaluated_depsgraph_get())
     me = ev.to_mesh()
     mw = ev.matrix_world
-    idx = set(v for p in me.polygons if p.material_index in shoe for v in p.vertices)
-    pts = [mw @ me.vertices[i].co for i in idx]
+    if shoe:
+        idx = set(v for p in me.polygons if p.material_index in shoe for v in p.vertices)
+        pts = [mw @ me.vertices[i].co for i in idx]
+    else:
+        ankle_z = max((arm.matrix_world @ pb.head).z for pb, _ in feet) + 0.02
+        pts = [mw @ v.co for v in me.vertices if (mw @ v.co).z <= ankle_z]
     ev.to_mesh_clear()
     out = []
     for pb, sign in feet:
@@ -301,8 +306,8 @@ bpy.ops.mmd_tools.export_vmd(
 ## Stage 3 — PoPo Final Verification & Live Stage Push
 
 1. Call `popo-mmd.inspect_vmd_file` with `vmdPath: FINAL_VMD_PATH` (`renderViews: true` for a front / 3-4 storyboard). Confirm `ok: true`: `critic.passed: true` with empty `critic.issues`, `audit.violations`, and `groundContact.offendingFrames: 0` (every rendered frame, tolerance `0.05 u`, negative = below floor). For an un-baked blocking file `ok: false` is expected — it is judged as-is — and `groundBakePreview` shows what the standard bake would do (`insertedKeys`, `after.offendingFrames`); `groundNotes` says which case you are in.
-2. Call `popo-mmd.push_vmd_to_stage` with `vmdPath: FINAL_VMD_PATH`, `modelId`, and `title`.
-   - The running PoPo 3D web stage (`http://127.0.0.1:4000`, also embedded in the DSH PoPo stage sidebar) loads and plays the exact Blender-refined `.vmd`. The tool reports `legsKeyed` (FK leg tracks present → the stage disables leg IK) and `baseRotated` (rotated root → the stage also disables physics).
+2. **(Optional — only if you want browser 3D preview)** Call `popo-mmd.push_vmd_to_stage` with `vmdPath: FINAL_VMD_PATH`, `modelId`, and `title`.
+   - If the standalone PoPo 3D web stage (`http://127.0.0.1:4000`, started with `npm run dev`) is running, it loads and plays the exact Blender-refined `.vmd`. Otherwise skip pushing and inspect via the PNG storyboards / Blender viewport. The tool reports `legsKeyed` (FK leg tracks present → the stage disables leg IK) and `baseRotated` (rotated root → the stage also disables physics).
    - **The gate reads every rendered frame.** `critiquePoseVmd`, `extractKeyframeCoords` and the ground measurement all sample the pose with the stage's own interpolation (engine-accurate bezier + slerp, `src/lib/fk.ts`), so a pass covers the frames between keys and desynchronized tracks (stagger, lag, cleanup keys) no longer produce false errors. What it does flag is real: between-key sinking on un-baked files (`ground_penetration` — fixed by PoPo's ground bake or the Blender cleanup in 3b) and authored key poses that sit off the floor (`groundNotes`: "authored key poses"; the bake never rewrites a key pose, so fix the MPL). Still good practice: never lag `腰` (it parents the legs), and key `センター` + `腰` + `足` + `ひざ` + `足首` together whenever one of them gets a key (the foot-plant cleanup does) — with that in place PoPo's FK matched the Blender mesh within ±3 mm (`footLift` ≤ 0.04 u) at every sampled frame.
 
 ---

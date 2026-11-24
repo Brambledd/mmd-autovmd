@@ -1,8 +1,8 @@
 /**
  * PoPo MCP Server (stdio JSON-RPC 2.0) — Blender-free MMD / PMX Motion Workbench.
  *
- * Exposes PoPo's deterministic 3D toolchain as MCP tools for external Agents (dsh,
- * Claude Code, Antigravity, Cursor, etc.):
+ * Exposes PoPo's deterministic 3D toolchain as MCP tools for external Agents
+ * (Antigravity, Claude Code, Cursor, DSH, etc.):
  *   - make_motion            (one call: compile → finalize → gate → storyboard → report)
  *   - list_models
  *   - inspect_pmx
@@ -53,7 +53,9 @@ import {
 } from "../lib/duo.ts"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const ROOT_DIR = path.resolve(__dirname, "../..")
+const ROOT_DIR = process.env.POPO_ROOT?.trim()
+  ? path.resolve(process.env.POPO_ROOT.trim())
+  : path.resolve(__dirname, "../..")
 const PUBLIC_DIR = path.join(ROOT_DIR, "public")
 
 type ResolvedModelEntry = {

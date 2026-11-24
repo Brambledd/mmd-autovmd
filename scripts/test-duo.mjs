@@ -184,6 +184,17 @@ try {
   assert(repSb.render.tiles.length >= 2)
   pass(`duo storyboard render (${repSb.render.tiles.length} tiles, ${repSb.render.width}x${repSb.render.height})`)
 
+  // Verify caelus squat primitive passes with 0 offending ground-contact frames
+  const stepCaelusSquat = await rpc("tools/call", {
+    name: "make_motion",
+    arguments: { primitive: "squat", modelId: "caelus", storyboard: false },
+  })
+  const repCaelus = JSON.parse(stepCaelusSquat.content.find((c) => c.type === "text").text)
+  assert.equal(repCaelus.ok, true, `caelus squat ok should be true: ${JSON.stringify(repCaelus.verdict)}`)
+  assert.equal(repCaelus.verdict.passed, true)
+  assert.equal(repCaelus.verdict.groundContact.offendingFrames, 0, "caelus squat must have 0 offending ground frames")
+  pass(`caelus squat ground-bake (0 offending, worst=${repCaelus.verdict.groundContact.worst}u)`)
+
   console.log(`\nALL ${okCount} DUO CHECKS PASSED`)
 } finally {
   child.kill()

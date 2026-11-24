@@ -439,7 +439,7 @@ function encodeBoneFrame(k) {
 }
 
 test("烘焙判据：作者线在容差带内时按绝对误差修 —— 帧间小幅浮起（相对作者线 < 容差）也压回地面", () => {
-  const { mpl } = squatPrim({})
+  const mpl = squatMpl
   const enhanced = finalizeMotion(compile(mpl), bones, { bake: false, enhanceOptions: { autoBlink: true } }).vmd
   const base = readVmdBoneKeys(enhanced).find((k) => k.jp === "腰" && k.frame === 70)
   assert(base, "fixture: waist key @f70")

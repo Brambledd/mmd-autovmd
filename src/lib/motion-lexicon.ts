@@ -789,7 +789,7 @@ function squat(p: Record<string, number>): string {
   const extra = (dir: "left" | "right", v: number) => (v > 0 ? `, sway ${dir} ${v}` : "")
 
   const legsStand =
-    "    leg_l sway left 5;\n    leg_r sway right 5;\n    knee_l reset;\n    knee_r reset;\n    ankle_l reset;\n    ankle_r reset;\n"
+    "    leg_l sway left 5;\n    leg_r sway right 5;\n    knee_l reset;\n    knee_r reset;\n    ankle_l reset;\n    ankle_r reset;\n    plant feet;\n"
   const legsBent = (hip: number, knee: number, out: number) =>
     `    leg_l bend forward ${hip}${extra("left", out)};\n` +
     `    leg_r bend forward ${hip}${extra("right", out)};\n` +

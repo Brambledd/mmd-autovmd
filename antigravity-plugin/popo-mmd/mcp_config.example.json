@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "popo-mmd": {
+      "command": "node",
+      "args": ["<POPO_ROOT>/src/mcp/popo-mcp-server.ts"],
+      "env": {
+        "POPO_ROOT": "<POPO_ROOT>"
+      }
+    }
+  }
+}

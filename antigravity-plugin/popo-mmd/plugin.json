@@ -1,0 +1,10 @@
+{
+  "name": "popo-mmd",
+  "displayName": "PoPo MMD Workbench",
+  "description": "MMD/PMX character motion authoring (MPL2), analytical IK, per-frame ground-bake critic, two-person duo alignment, and Blender mmd_tools hybrid workflow.",
+  "suggestedPrompts": [
+    "用 topaz 生成一段 3 次深蹲的 VMD 动作并检查贴地和分镜",
+    "用 topaz 和 caelus 编排一段面对面握手或击掌的双人交互动作",
+    "检查导出的 VMD 文件穿模与逐帧贴地情况"
+  ]
+}
