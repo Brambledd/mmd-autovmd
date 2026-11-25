@@ -867,13 +867,13 @@ const TOOLS = [
   {
     name: "compile_motion_intent",
     description:
-      "Compile a high-level beat-based MotionIntent JSON directly into a smooth, grounded .vmd using PoPo's Semantic-Kinematic Rig Profile (multi-slice elliptical hulls, mesh-snapped surface anchors, 6-DOF palm alignment, hybrid spring-damper dynamics, 2-bone Leg IK grounding, and 5-fingertip collision clamp). Much faster and more natural than raw FK MPL2.",
+      "Compile a high-level beat-based MotionIntent JSON directly into a smooth, grounded .vmd using PoPo's Semantic-Kinematic Rig Profile (multi-slice elliptical hulls, mesh-snapped surface anchors, 6-DOF palm basis, hybrid spring-damper dynamics, 2-bone Leg IK grounding, soft-tissue coupling for 腕捩/グルーブ/胸, and Verlet secondary physics chains for hair/ribbons/skirts).",
     inputSchema: {
       type: "object",
       properties: {
         intent: {
           type: "object",
-          description: "MotionIntent JSON with beats: [{ at, effort?, stance?, spine?, hand_l?, hand_r?, gaze?, face? }]",
+          description: "MotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, beats: [{ at, effort?, passThrough?, stance?, spine?, hand_l?, hand_r?, gaze?, face? }] }",
         },
         modelId: { type: "string", description: "Model id (default: topaz)" },
         pmxPath: { type: "string", description: "Optional local .pmx path overriding modelId" },

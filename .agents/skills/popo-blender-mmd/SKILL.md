@@ -22,7 +22,8 @@ Never hand-author raw per-bone FK Euler angles. Always author high-level beat-ba
    - **4-Slice Elliptical Body Hulls**: Extracts non-circular `(y, cx, cz, rx, rz)` cross-sections for head, chest, abdomen, pelvis, and legs, automatically stripping hair/ribbons/skirts via PMX `mode = 1/2` physics rigid detection + material tags.
    - **Mesh-Snapped Surface Anchors & Morph Landmarks**: Extracts exact eye/mouth/cheek heights from PMX vertex morphs (`まばたき / あ / 照れ`) and snaps surface anchors (`cheek_l/r`, `chin`, `forehead`, `waist_side_l/r`, `chest_center`) directly to real PMX surface vertices.
    - **6-DOF Palm Basis & Joint ROM**: Auto-derives `restFingerDir` and `restPalmNormal` from wrist/index/pinky bones, with anatomical forearm twist (`±85°`), wrist swing (`58°`), and clavicle coupling limits.
-   - **Layered Semantic Expressions**: Separates eyebrow, eye, and mouth channels so `smile` / `warm_smile` lift mouth corners (`口角上げ`) + soften brows (`にこり`) while keeping eyes **open**; `happy_squint` / `laugh` explicitly close eyes; auto-blinks skip frames where eyes are already closed.
+   - **Layered Semantic Expressions & All-Morph Discovery**: Separates eyebrow, eye, and mouth channels so `smile` / `warm_smile` lift mouth corners (`口角上げ`) + soften brows (`にこり`) while keeping eyes **open**; `happy_squint` / `laugh` explicitly close eyes; auto-blinks skip frames where eyes are already closed. Discovers all PMX morph kinds (`group / vertex / bone / uv / material`) so extra model morphs can also be driven by name inside `face`.
+   - **Soft-Tissue & Physics Chain Discovery**: Detects real skinned chest soft-tissue bones (`左胸上2 / 右胸上2`), torso elastic bounce (`グルーブ`), upper-arm muscle twist (`左腕捩 / 右腕捩`), and builds a topologically ordered `physicsNodes` graph from `mode = 1/2` hair/ribbon/skirt rigids.
 
 2. **Continuous 30fps Hybrid-Dynamics Solver (`src/lib/rig-solver.ts`)**
    - **Zero-Pop Continuity**: All elbow pole vectors, 6-DOF palm orientations, collision margins, and rest↔reach blends interpolate continuously, followed by 2-pass zero-phase SLERP smoothing on upper-body/arm tracks (pelvis & legs untouched).
@@ -31,6 +32,7 @@ Never hand-author raw per-bone FK Euler angles. Always author high-level beat-ba
    - **Source-Level Leg Grounding**: Analytical 2-bone Leg IK runs every frame, keeping soles flush (`< 1 mm`) across weight shifts and squats without post-hoc foot-plant baking.
    - **Flush Surface Contact + Hard Collision Guardrail**: 1-step closed-loop finger-pad feedback + contact finger-spread adaptation + final real-FK 5-fingertip & forearm elliptical collision clamp.
    - **Inertial Wrist & Finger Drag**: Velocity-driven follow-through whip during free-air waves/raises, automatically masked to zero during face/waist contact.
+   - **Pose & Inertia Soft-Tissue Coupling + Secondary Physics**: Automatically splits 45% upper-arm twist into `腕捩`, routes elastic bounce to `グルーブ`, drives chest soft tissue from arm elevation/compression + torso acceleration, and simulates Verlet secondary physics on hair/ribbons/skirts with elliptical hull collision (`secondaryPhysics: true` by default; set `false` when using Blender native Bullet physics).
 
 ---
 
@@ -46,6 +48,7 @@ Call **`popo-mmd.compile_motion_intent`** with `{ modelId, intent, outVmdPath }`
   "fps": 30,
   "breathing": true,
   "autoBlink": true,
+  "secondaryPhysics": true,
   "beats": [
     {
       "at": 0.0,
@@ -64,6 +67,7 @@ Call **`popo-mmd.compile_motion_intent`** with `{ modelId, intent, outVmdPath }`
 
 ### Field Reference
 
+- **`secondaryPhysics`**: `true` (default, built-in Verlet hair/ribbon/skirt secondary spring simulation in VMD) or `false` (leave physics bones unkeyed when running Blender's native Bullet physics via `bpy.ops.mmd_tools.build_rig()`).
 - **`effort`**: `"soft"` (gentle smooth), `"snappy"` (crisp fast-out), `"bouncy"` (playful elastic), `"heavy"` (weighted anticipation).
 - **`passThrough`**: `true` for continuous mid-motion beats (no dead-stop); beats `≤ 0.65s` apart auto-enable pass-through.
 - **`stance`**:
@@ -164,7 +168,29 @@ if arm.animation_data and arm.animation_data.action:
             kp.handle_left_type = kp.handle_right_type = "AUTO_CLAMPED"
         fc.update()
 
-# 6) Frame viewport nicely in Material Preview at frame 1
+# 6) Optional: Add Corrective Smooth right after Armature modifier to preserve joint volume on deep bends
+if mesh is not None:
+    mod = mesh.modifiers.get("PoPo_CorrectiveSmooth") or mesh.modifiers.new("PoPo_CorrectiveSmooth", "CORRECTIVE_SMOOTH")
+    mod.factor = 0.5
+    mod.iterations = 5
+    mod.smooth_type = "LENGTH_WEIGHTED"
+    mod.rest_source = "ORCO"
+    mod.use_pin_boundary = True
+    arm_idx = next((i for i, m in enumerate(mesh.modifiers) if m.type == "ARMATURE"), None)
+    if arm_idx is not None:
+        cur_idx = list(mesh.modifiers).index(mod)
+        while cur_idx > arm_idx + 1:
+            bpy.ops.object.select_all(action="DESELECT")
+            mesh.select_set(True)
+            bpy.context.view_layer.objects.active = mesh
+            bpy.ops.object.modifier_move_up(modifier=mod.name)
+            cur_idx -= 1
+
+# 7) Optional: Native Blender Bullet physics (ONLY when VMD was compiled with secondaryPhysics: false)
+# bpy.ops.object.select_all(action="DESELECT"); root.select_set(True); bpy.context.view_layer.objects.active = root
+# bpy.ops.mmd_tools.build_rig()
+
+# 8) Frame viewport nicely in Material Preview at frame 1
 sc = bpy.context.scene
 sc.frame_set(1)
 for window in bpy.context.window_manager.windows:
