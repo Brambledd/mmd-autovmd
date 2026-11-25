@@ -56,3 +56,10 @@ next-env.d.ts
 # local scratch & verification outputs
 /.tmp/
 .tmp-*
+
+# local AI guide & ad-hoc debug scripts
+/CLAUDE.md
+/scripts/dump-vmd-keys.mjs
+/scripts/duo-pipeline.mjs
+/scripts/keydist.mjs
+/scripts/track.mjs

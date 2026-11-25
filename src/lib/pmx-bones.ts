@@ -390,7 +390,7 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
   let faceSkinEnvelope: BoneEnvelope | undefined
 
   const accEnv = (map: Record<string, BoneEnvelope>, key: string, x: number, y: number, z: number, d: number) => {
-    let env = map[key]
+    const env = map[key]
     if (!env) {
       map[key] = {
         count: 1,
