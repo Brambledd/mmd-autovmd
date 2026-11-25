@@ -86,6 +86,8 @@ export interface MotionIntent {
   breathing?: boolean
   /** Auto natural eye blinks (default true) */
   autoBlink?: boolean
+  /** Lightweight acceleration-driven secondary spring physics for hair/ribbons/skirts (default true; set false if using native Blender Bullet physics) */
+  secondaryPhysics?: boolean
   beats: MotionBeat[]
 }
 
@@ -685,6 +687,18 @@ export function solveMotionIntent(
   }
   const prevWristWorld: { l: V3 | null; r: V3 | null } = { l: null, r: null }
 
+  // Phase 1 Soft-Tissue Dynamics: torso acceleration springs for pose + inertia driven chest deformation
+  const sprChestInertiaY = new SecondOrderScalar(0)
+  const sprChestInertiaX = new SecondOrderScalar(0)
+  let prevChestWorld: V3 | null = null
+  let prevChestVel: V3 = [0, 0, 0]
+
+  // Phase 2 Secondary Physics Chains: Verlet world-space tip particles for hair/ribbons/skirts
+  const physNodes = intent.secondaryPhysics !== false ? (profile.softTissue?.physicsNodes ?? []) : []
+  const physBoneSet = new Set(physNodes.map((n) => n.boneJp))
+  const physTipPos = new Map<string, V3>()
+  const physPrevTipPos = new Map<string, V3>()
+
   const tracks = new Map<string, RawBoneSample[]>()
   const recordBone = (jp: string, frame: number, pos: V3, quat: Quat) => {
     if (!bones.indexByJp.has(jp)) return
@@ -707,9 +721,11 @@ export function solveMotionIntent(
     const f = Math.round(b.at * fps)
     // Aggregate max weight per PMX morph name at this beat frame (prevents overlapping aliases like smile & warm_smile from overwriting each other!)
     const maxByPmx = new Map<string, number>()
+    // Also allow driving any discovered PMX morph verbatim if not aliased in profile.morphMap (e.g. material/bone/body morphs)
+    const knownExtraMorphs = new Set((profile.softTissue?.extraMorphs ?? []).map((m) => m.jp))
     for (const sem of allSemanticMorphs) {
       const w = Math.max(0, Math.min(1, b.face?.[sem] ?? 0))
-      const pmxNames = profile.morphMap[sem]
+      const pmxNames = profile.morphMap[sem] ?? (knownExtraMorphs.has(sem) ? [sem] : undefined)
       if (!pmxNames) continue
       for (const name of pmxNames) {
         const prev = maxByPmx.get(name) ?? 0
@@ -787,12 +803,18 @@ export function solveMotionIntent(
       localRots.set(jp, q)
     }
 
-    // ---- Layer 1: Pelvis / Center + Exact 2-Bone Leg IK (Source-level Grounding) ----
+    // ---- Layer 1: Pelvis / Center + Elastic Groove + Exact 2-Bone Leg IK (Source-level Grounding) ----
+    const grooveJp = profile.softTissue?.grooveJp
     const centerShiftX = weightTarget * hipSpreadX * 0.78
-    const centerShiftY = -(squatTarget * maxSquatDrop) + pelvisBounce * 0.35 + breath * 0.03
+    const elasticY = pelvisBounce * 0.35 + breath * 0.03
     // Natural hip hinge: hips shift slightly backward (+Z) when squatting
     const centerShiftZ = squatTarget * 1.65
-    localTrans.set("センター", [centerShiftX, centerShiftY, centerShiftZ])
+    if (grooveJp && bones.indexByJp.has(grooveJp)) {
+      localTrans.set("センター", [centerShiftX, -(squatTarget * maxSquatDrop), centerShiftZ])
+      localTrans.set(grooveJp, [0, elasticY, 0])
+    } else {
+      localTrans.set("センター", [centerShiftX, -(squatTarget * maxSquatDrop) + elasticY, centerShiftZ])
+    }
 
     // Subtle contrapposto hip roll when weight shifts to one foot
     const pelvisRollDeg = -weightLag * 4.5
@@ -1185,7 +1207,24 @@ export function solveMotionIntent(
           const wAct = blendToNeutral ? smoothstep01(Math.min(1, activeW / 0.25)) : 1.0
           const qNeutralArm = profile.neutralPose[arm.armJp] ?? IDENTITY
           const qNeutralElb = profile.neutralPose[arm.elbowJp] ?? IDENTITY
-          localRots.set(arm.armJp, wAct < 1 ? qSlerp(qNeutralArm, curSol.qArmLocal, wAct) : curSol.qArmLocal)
+          const qArmFull = wAct < 1 ? qSlerp(qNeutralArm, curSol.qArmLocal, wAct) : curSol.qArmLocal
+
+          // Phase 1 Upper-Arm Muscle Twist Split (左腕捩 / 右腕捩 -> auto-drives 腕捩1/2/3 grant chain!):
+          // Decompose qArmFull = qSwing * qTwist around restUpperDir; child armTwist gets 45% of axial twist
+          // while parent arm keeps qSwing * qTwist55 -> preserves exact elbow/wrist world positions to 0.000mm!
+          if (arm.armTwistJp && bones.indexByJp.has(arm.armTwistJp)) {
+            const nq = qArmFull.w < 0 ? { x: -qArmFull.x, y: -qArmFull.y, z: -qArmFull.z, w: -qArmFull.w } : qNorm(qArmFull)
+            const ax = vNorm(arm.restUpperDir)
+            const proj = vDot([nq.x, nq.y, nq.z], ax)
+            const qTwistAll = qNorm({ x: ax[0] * proj, y: ax[1] * proj, z: ax[2] * proj, w: nq.w })
+            const qTwistChild = qClampDeg(qSlerp(IDENTITY, qTwistAll, 0.45), 55)
+            const qArmParent = qNorm(qMul(qArmFull, qConj(qTwistChild)))
+            localRots.set(arm.armJp, qArmParent)
+            localRots.set(arm.armTwistJp, qTwistChild)
+          } else {
+            localRots.set(arm.armJp, qArmFull)
+          }
+
           localRots.set(arm.elbowJp, wAct < 1 ? qSlerp(qNeutralElb, curSol.qElbowLocal, wAct) : curSol.qElbowLocal)
           if (arm.wristTwistJp && bones.indexByJp.has(arm.wristTwistJp)) {
             localRots.set(arm.wristTwistJp, wAct < 1 ? qSlerp(IDENTITY, curSol.qTwistLocal, wAct) : curSol.qTwistLocal)
@@ -1354,6 +1393,182 @@ export function solveMotionIntent(
       }
     }
 
+    // ---- Layer 5: Dynamic Pose + Inertia Driven Soft-Tissue Coupling (Chest L/R) ----
+    const st = profile.softTissue
+    if (st && (st.chestL || st.chestR)) {
+      const chestParentJp = bones.indexByJp.has("上半身2") ? "上半身2" : "上半身"
+      const chestIdx = bones.indexByJp.get(chestParentJp)
+      if (chestIdx != null) {
+        const fkSoft = solveFkSnapshot(bones, restWorld, localRots, localTrans)
+        const curChestPos = fkSoft.pos.get(chestIdx)!
+        const prevCP = prevChestWorld ?? curChestPos
+        const curVel = vScale(vSub(curChestPos, prevCP), 1 / dt)
+        const rawAcc = vScale(vSub(curVel, prevChestVel), 1 / dt)
+        prevChestWorld = curChestPos
+        prevChestVel = curVel
+
+        // Soft-tissue 2nd-order inertial response to torso vertical/lateral acceleration (subtle & physically damped)
+        const accYClamped = Math.max(-25, Math.min(25, rawAcc[1]))
+        const accXClamped = Math.max(-20, Math.min(20, rawAcc[0]))
+        const inertiaY = sprChestInertiaY.step(dt, -accYClamped * 0.22, 3.1, 0.44, 0.1)
+        const inertiaX = sprChestInertiaX.step(dt, -accXClamped * 0.18, 2.9, 0.48, 0.1)
+
+        for (const side of ["l", "r"] as const) {
+          const boneJp = side === "l" ? st.chestL : st.chestR
+          if (!boneJp || !bones.indexByJp.has(boneJp)) continue
+          const sSign = side === "l" ? 1 : -1
+          const armIdx = bones.indexByJp.get(profile.arms[side].armJp)
+          const elbowIdx = bones.indexByJp.get(profile.arms[side].elbowJp)
+          const wristIdx = bones.indexByJp.get(profile.arms[side].wristJp)
+          let elevLift = 0
+          let inwardCompress = 0
+          if (armIdx != null && elbowIdx != null && wristIdx != null) {
+            const shP = fkSoft.pos.get(armIdx)!
+            const elP = fkSoft.pos.get(elbowIdx)!
+            const wrP = fkSoft.pos.get(wristIdx)!
+            // Arm elevation above relaxed hang lifts pectoralis/chest gently upward
+            elevLift = Math.max(0, Math.min(1.5, (elP[1] - (shP[1] - 2.6)) / 3.0))
+            // Arm reaching inward across front of chest compresses lateral chest slightly
+            const inwardX = (shP[0] - wrP[0]) * sSign
+            const inFront = -(wrP[2] - shP[2])
+            if (inwardX > 0.3 && inFront > 0.4) {
+              inwardCompress = Math.min(1.0, inwardX / 2.2)
+            }
+          }
+          const pitchDeg = Math.max(-9, Math.min(9, -elevLift * 4.2 + inertiaY * 1.4 - breath * 1.1))
+          const yawDeg = Math.max(-5, Math.min(5, sSign * (elevLift * 1.2 - inwardCompress * 3.0) + inertiaX * 1.1))
+          const rollDeg = Math.max(-4, Math.min(4, inertiaX * 0.9))
+          localRots.set(
+            boneJp,
+            qMul(qFromAxisAngle([1, 0, 0], pitchDeg), qMul(qFromAxisAngle([0, 1, 0], yawDeg), qFromAxisAngle([0, 0, 1], rollDeg))),
+          )
+        }
+      }
+    }
+
+    // ---- Layer 6: Lightweight Acceleration-Driven Secondary Physics Chains (Hair / Ribbons / Skirts) ----
+    if (physNodes.length > 0) {
+      const fkPhys = solveFkSnapshot(bones, restWorld, localRots, localTrans)
+      const solvedPhysPos = new Map<string, V3>()
+      const solvedPhysRot = new Map<string, Quat>()
+      const anchorRotByNode = new Map<string, Quat>() // rigid skeleton anchor rotation (prevents cumulative scorpion-tail curl!)
+      const dt2 = dt * dt
+
+      // Rebuild elliptical hulls in final post-Layer-5 world space for hair/cloth collision
+      const physHulls: WorldHull[] = profile.capsules.map((cap) => {
+        const idx = bones.indexByJp.get(cap.boneJp)
+        if (idx == null) return null
+        const bp = fkPhys.pos.get(idx)!
+        const br = fkPhys.rot.get(idx)!
+        return {
+          id: cap.id,
+          bonePos: bp,
+          boneRot: br,
+          a: vAdd(bp, qRotate(br, cap.localA)),
+          b: vAdd(bp, qRotate(br, cap.localB)),
+          radiusA: cap.radiusA ?? cap.radius,
+          radiusB: cap.radiusB ?? cap.radius,
+          slices: cap.slices,
+        }
+      }).filter((c): c is NonNullable<typeof c> => c !== null)
+
+      for (let ni = 0; ni < physNodes.length; ni++) {
+        const node = physNodes[ni]
+        if (!bones.indexByJp.has(node.boneJp)) continue
+
+        let parentPos: V3
+        let parentRot: Quat
+        let anchorRot: Quat
+        if (node.parentIsPhysics && solvedPhysPos.has(node.parentJp)) {
+          parentPos = solvedPhysPos.get(node.parentJp)!
+          parentRot = solvedPhysRot.get(node.parentJp)!
+          anchorRot = anchorRotByNode.get(node.parentJp) ?? parentRot
+        } else {
+          const pIdx = bones.indexByJp.get(node.parentJp)
+          parentPos = pIdx != null ? fkPhys.pos.get(pIdx)! : [0, 15, 0]
+          parentRot = pIdx != null ? fkPhys.rot.get(pIdx)! : IDENTITY
+          anchorRot = parentRot
+        }
+        anchorRotByNode.set(node.boneJp, anchorRot)
+
+        const rootPos = vAdd(parentPos, qRotate(parentRot, node.restOffsetFromParent))
+        // Parent-frame rest axis (for local quaternion) vs rigid-anchor rest axis (for spring return & anti-curl cone clamp!)
+        const restDirParentWorld = vNorm(qRotate(parentRot, node.restDir))
+        const restDirAnchorWorld = vNorm(qRotate(anchorRot, node.restDir))
+        // Long cloth drapes naturally toward gravity (-Y) blended with rigid-anchor hang
+        const isHair = node.kind === "hair"
+        const targetDrapeDir = isHair
+          ? restDirAnchorWorld
+          : vNorm(vLerp(restDirAnchorWorld, [0, -1, 0], Math.min(0.65, 0.25 + node.depth * 0.06)))
+        const restTip = vAdd(rootPos, vScale(targetDrapeDir, node.segLen))
+
+        const prevTip = physPrevTipPos.get(node.boneJp)
+        const curTip = physTipPos.get(node.boneJp)
+
+        if (!curTip || !prevTip || frame === 0) {
+          physTipPos.set(node.boneJp, restTip)
+          physPrevTipPos.set(node.boneJp, restTip)
+          solvedPhysPos.set(node.boneJp, rootPos)
+          solvedPhysRot.set(node.boneJp, parentRot)
+          localRots.set(node.boneJp, IDENTITY)
+          continue
+        }
+
+        const drag = isHair ? 0.78 : 0.82
+        const stiffness = isHair
+          ? Math.max(0.18, 0.36 - node.depth * 0.04)
+          : Math.max(0.14, 0.30 - node.depth * 0.018)
+        const gravity = isHair ? 14.0 : 28.0
+        // Cone clamp measured against targetDrapeDir (anchored to rigid skeleton + gravity, NEVER compounds per-link curl!)
+        const maxConeDeg = isHair
+          ? Math.min(22, 10 + node.depth * 3.0)
+          : Math.min(28, 12 + node.depth * 2.2)
+
+        const vel = vScale(vSub(curTip, prevTip), drag)
+        const springPull = vScale(vSub(restTip, curTip), stiffness)
+        const breezeScale = Math.min(1, node.depth * 0.20) * (isHair ? 0.10 : 0.22)
+        const phase = ni * 0.73
+        const breeze: V3 = [
+          Math.sin(timeSec * 1.7 + phase) * breezeScale * dt2 * 16,
+          0,
+          Math.cos(timeSec * 1.25 + phase) * breezeScale * 0.7 * dt2 * 16,
+        ]
+        const gravPull: V3 = [0, -gravity * dt2 * (isHair ? 0.14 : 0.28), 0]
+        let candTip = vAdd(vAdd(vAdd(curTip, vel), springPull), vAdd(gravPull, breeze))
+
+        let candDir = vNorm(vSub(candTip, rootPos))
+        const dotRest = Math.max(-1, Math.min(1, vDot(targetDrapeDir, candDir)))
+        const angDeg = (Math.acos(dotRest)) / DEG
+        if (angDeg > maxConeDeg) {
+          const qClamp = qSlerp(IDENTITY, qFromTwoVectors(targetDrapeDir, candDir), maxConeDeg / angDeg)
+          candDir = vNorm(qRotate(qClamp, targetDrapeDir))
+        }
+        candTip = vAdd(rootPos, vScale(candDir, node.segLen))
+
+        // Elliptical Body Hull Collision Push-out (keeps hair/ribbons outside head/chest/torso/thighs!)
+        for (const hull of physHulls) {
+          if (isHair && hull.id !== "head" && hull.id !== "chest") continue
+          if (!isHair && hull.id === "head") continue
+          const margin = (isHair && hull.id === "head") ? 0.01 : 0.03
+          const pushed = pushOutOfHull(candTip, hull, margin)
+          if (vLen(vSub(pushed, candTip)) > 1e-4) {
+            candDir = vNorm(vSub(pushed, rootPos))
+            candTip = vAdd(rootPos, vScale(candDir, node.segLen))
+          }
+        }
+
+        const qDeltaWorld = qFromTwoVectors(restDirParentWorld, candDir)
+        const qWorld = qNorm(qMul(qDeltaWorld, parentRot))
+        const qLocal = qNorm(qMul(qConj(parentRot), qWorld))
+
+        physPrevTipPos.set(node.boneJp, curTip)
+        physTipPos.set(node.boneJp, candTip)
+        solvedPhysPos.set(node.boneJp, rootPos)
+        solvedPhysRot.set(node.boneJp, qWorld)
+        localRots.set(node.boneJp, qLocal)
+      }
+    }
+
     // Record all touched bones for this frame
     for (const [jp, q] of localRots.entries()) {
       const tr = localTrans.get(jp) ?? [0, 0, 0] as V3
@@ -1372,8 +1587,12 @@ export function solveMotionIntent(
   const boneKeys: BoneKey[] = []
   for (const [jp, rawSamples] of tracks.entries()) {
     rawKeyCount += rawSamples.length
-    const samples = GROUND_LOCKED_BONES.has(jp) ? rawSamples : smoothQuatTrack(rawSamples, 2)
-    const kept = decimateTrack(samples, 0.25, 0.008)
+    const isPhys = physBoneSet.has(jp)
+    const samples = GROUND_LOCKED_BONES.has(jp)
+      ? rawSamples
+      : smoothQuatTrack(rawSamples, 2)
+    // Secondary physics chains use 1.4° angle tolerance to keep VMD compact & silky
+    const kept = decimateTrack(samples, isPhys ? 1.4 : 0.25, 0.008)
     const nameBytes = encodeBoneName(jp)
     for (const s of kept) {
       boneKeys.push({

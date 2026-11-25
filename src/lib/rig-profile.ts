@@ -114,6 +114,36 @@ export interface HandGripSpec {
   spread: number
 }
 
+/** Single node in an auto-discovered secondary physics chain (hair / ribbon / skirt / coattail). */
+export interface PhysicsChainNode {
+  boneJp: string
+  parentJp: string
+  /** Whether parentJp is another physics node (false = rooted on rigid skeleton like 頭 / 左肩 / 上半身2) */
+  parentIsPhysics: boolean
+  /** Category for tuning stiffness/drag/maxAngle */
+  kind: "hair" | "cloth"
+  /** Depth from chain root (0 = root, deeper = softer & more trailing) */
+  depth: number
+  /** Rest offset from parent bone position in model space */
+  restOffsetFromParent: V3
+  /** Rest unit bone axis toward child (or downward fallback for leaf tips) */
+  restDir: V3
+  /** Segment length in u */
+  segLen: number
+}
+
+export interface SoftTissueRig {
+  /** Independent torso elastic bounce bone (グルーブ) if present */
+  grooveJp: string | null
+  /** Skinned left/right chest soft-tissue bones (e.g. 左胸上2 / 右胸上2 or 左胸 / 右胸) */
+  chestL: string | null
+  chestR: string | null
+  /** Non-facial / auxiliary morph channels (material glow, bone morphs, group morphs, body vertex morphs) */
+  extraMorphs: Array<{ jp: string; kind: "group" | "vertex" | "bone" | "uv" | "material"; panel: number }>
+  /** Topologically-ordered secondary physics bone nodes (hair / ribbons / skirts / coattails) */
+  physicsNodes: PhysicsChainNode[]
+}
+
 export interface RigProfile {
   version: "1.0"
   modelId: string
@@ -133,6 +163,8 @@ export interface RigProfile {
   handGrips: Record<string, HandGripSpec>
   /** Anatomical joint range-of-motion soft limits */
   jointRom: JointRomSpec
+  /** Discovered soft-tissue, elastic groove, and non-facial morph channels */
+  softTissue: SoftTissueRig
   /** Optional per-model calibration notes */
   calibrationNotes: string[]
 }
@@ -528,7 +560,7 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
   }
 
   // 7. Mass proxy for CoM balance reasoning
-  const massProxy: MassNode[] = [
+  const massCandidates: MassNode[] = [
     { boneJp: "頭", localOffset: [0, 1.0, 0], massRatio: 0.08 },
     { boneJp: chestBone, localOffset: [0, 1.0, -0.3], massRatio: 0.28 },
     { boneJp: "上半身", localOffset: [0, 0.8, -0.2], massRatio: 0.14 },
@@ -537,10 +569,118 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
     { boneJp: "右腕", localOffset: [-1.2, -0.8, 0], massRatio: 0.045 },
     { boneJp: "左足", localOffset: [0, -2.5, 0], massRatio: 0.135 },
     { boneJp: "右足", localOffset: [0, -2.5, 0], massRatio: 0.135 },
-  ].filter((n) => has(n.boneJp))
+  ]
+  const massProxy: MassNode[] = massCandidates.filter((n) => has(n.boneJp))
 
-  // 8. Normalized morph map
+  // 8. Normalized morph map + soft-tissue / extra-morph discovery
   const morphMap = buildMorphMap(bones.faceMorphs)
+
+  const pickSkinned = (candidates: string[]): string | null => {
+    for (const c of candidates) {
+      if (has(c) && (env[c]?.count ?? 0) > 0) return c
+    }
+    return null
+  }
+  const chestL = pickSkinned(["左胸上2", "左胸", "左乳", "左胸変形"])
+  const chestR = pickSkinned(["右胸上2", "右胸", "右乳", "右胸変形"])
+  const grooveJp = has("グルーブ") ? "グルーブ" : null
+  const KIND_NAMES = ["group", "vertex", "bone", "uv", "uv", "uv", "uv", "uv", "material"] as const
+  const extraMorphs = (bones.allMorphs ?? [])
+    .filter((mo) => mo.kind !== 1 || mo.panel === 4)
+    .map((mo) => ({
+      jp: mo.jp,
+      kind: (KIND_NAMES[mo.kind] ?? "vertex") as "group" | "vertex" | "bone" | "uv" | "material",
+      panel: mo.panel,
+    }))
+
+  if (chestL && chestR) {
+    notes.push(`Soft-tissue chest bones discovered (skinned): ${chestL} (${env[chestL]?.count}v), ${chestR} (${env[chestR]?.count}v)`)
+  }
+  if (grooveJp) {
+    notes.push(`Torso elastic bounce bone discovered: ${grooveJp}`)
+  }
+
+  // 9. Auto-discover secondary physics bone chains (mode=1/2 rigid bodies excluding chest soft tissue & core skeleton)
+  const CORE_SKIP = new Set([
+    "全ての親", "センター", "グルーブ", "腰", "下半身", "上半身", "上半身2", "首", "頭",
+    "左肩", "右肩", "左腕", "右腕", "左ひじ", "右ひじ", "左手首", "右手首",
+    "左足", "右足", "左ひざ", "右ひざ", "左足首", "右足首",
+    ...(chestL ? [chestL] : []),
+    ...(chestR ? [chestR] : []),
+  ])
+  const physIdxSet = new Set<number>()
+  for (const rb of bones.rigids) {
+    if ((rb.mode === 1 || rb.mode === 2) && rb.bone >= 0 && rb.bone < bones.bones.length) {
+      const jp = bones.bones[rb.bone].jp
+      if (!CORE_SKIP.has(jp) && !/胸|乳/.test(jp)) {
+        physIdxSet.add(rb.bone)
+      }
+    }
+  }
+  // Map each physics bone to its children (for accurate restDir & segLen)
+  const physChildren = new Map<number, number[]>()
+  for (const idx of physIdxSet) {
+    const pIdx = bones.bones[idx].parent
+    if (pIdx >= 0) {
+      const list = physChildren.get(pIdx) ?? []
+      list.push(idx)
+      physChildren.set(pIdx, list)
+    }
+  }
+  // Topological order (PMX stores parents before children; sort by bone index as safeguard)
+  const sortedPhys = [...physIdxSet].sort((a, b) => a - b)
+  const depthMap = new Map<number, number>()
+  const anchorKindMap = new Map<number, "hair" | "cloth">()
+  const physicsNodes: PhysicsChainNode[] = []
+
+  for (const idx of sortedPhys) {
+    const b = bones.bones[idx]
+    if (b.parent < 0 || b.parent >= bones.bones.length) continue
+    const pBone = bones.bones[b.parent]
+    const parentIsPhysics = physIdxSet.has(b.parent)
+    const depth = parentIsPhysics ? (depthMap.get(b.parent) ?? 0) + 1 : 0
+    depthMap.set(idx, depth)
+
+    let kind: "hair" | "cloth"
+    if (parentIsPhysics) {
+      kind = anchorKindMap.get(b.parent) ?? "cloth"
+    } else {
+      kind = (pBone.jp === "頭" || /hair|髪|髮|bang|ponytail/i.test(b.jp)) ? "hair" : "cloth"
+    }
+    anchorKindMap.set(idx, kind)
+
+    const curPos = toV3(world.get(idx))
+    const parPos = toV3(world.get(b.parent))
+    const restOffsetFromParent = vSub(curPos, parPos)
+
+    // Determine segment direction & length from first physics child (or extrapolate from parent->cur for leaf tip)
+    const kids = physChildren.get(idx) ?? []
+    let segVec: V3
+    if (kids.length > 0) {
+      const kidPos = toV3(world.get(kids[0]))
+      segVec = vSub(kidPos, curPos)
+    } else {
+      segVec = vLen(restOffsetFromParent) > 0.15 ? restOffsetFromParent : [0, -0.6, 0]
+    }
+    const segLen = Math.max(0.25, Math.min(2.5, vLen(segVec)))
+    const restDir = vLen(segVec) > 1e-4 ? vNorm(segVec) : [0, -1, 0] as V3
+
+    physicsNodes.push({
+      boneJp: b.jp,
+      parentJp: pBone.jp,
+      parentIsPhysics,
+      kind,
+      depth,
+      restOffsetFromParent: v3r(restOffsetFromParent),
+      restDir: v3r(restDir),
+      segLen: r2(segLen),
+    })
+  }
+  if (physicsNodes.length > 0) {
+    const hairC = physicsNodes.filter((n) => n.kind === "hair").length
+    const clothC = physicsNodes.length - hairC
+    notes.push(`Secondary physics chains discovered: ${physicsNodes.length} nodes (${hairC} hair, ${clothC} cloth/ribbons)`)
+  }
 
   return {
     version: "1.0",
@@ -561,6 +701,13 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       wristSwingMaxDeg: 58,
       shoulderLiftMaxDeg: 20,
       kneeFlexMaxDeg: 142,
+    },
+    softTissue: {
+      grooveJp,
+      chestL,
+      chestR,
+      extraMorphs,
+      physicsNodes,
     },
     calibrationNotes: notes,
   }

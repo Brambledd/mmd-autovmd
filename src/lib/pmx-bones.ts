@@ -78,6 +78,13 @@ export interface EllipticalSlice {
   rz: number
 }
 
+/** Metadata for any PMX morph (0=group, 1=vertex, 2=bone, 3..7=UV, 8=material; panel: 1=brow, 2=eye, 3=mouth, 4=other). */
+export interface PmxMorphInfo {
+  jp: string
+  kind: number
+  panel: number
+}
+
 export interface PmxBones {
   version: number
   modelName: string
@@ -85,6 +92,8 @@ export interface PmxBones {
   rigids: PmxRigid[]
   /** Vertex (face) morph names — the model's usable expressions. */
   faceMorphs: string[]
+  /** Complete catalog of all PMX morphs across all kinds (group/vertex/bone/UV/material) with panel category. */
+  allMorphs?: PmxMorphInfo[]
   /** jp -> bone index lookup for FK / audit code. */
   indexByJp: Map<string, number>
   /** Per-bone skinned vertex spatial envelopes (keyed by bone jp). */
@@ -278,17 +287,19 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     bones.push({ jp, en, pos, parent, ik, ...(grant ? { grant } : {}) })
   }
 
-  // morphs (collect vertex-morph names + extract exact 3D facial landmarks from まばたき / あ / 照れ)
+  // morphs (collect all morph metadata + extract exact 3D facial landmarks from まばたき / あ / 照れ)
   const moCount = r.i32()
   const faceMorphs: string[] = []
+  const allMorphs: PmxMorphInfo[] = []
   const facialLandmarks: FacialLandmarks = {}
   const round2 = (n: number) => Number(n.toFixed(2))
 
   for (let i = 0; i < moCount; i++) {
     const jp = r.str(enc as 0 | 1)
     r.str(enc as 0 | 1)
-    r.i8()
+    const panel = r.i8()
     const kind = r.i8()
+    allMorphs.push({ jp, kind, panel })
     const n = r.i32()
     if (kind === 0) { for (let k = 0; k < n; k++) { r.idx(morphIdx); r.raw(4) } }
     else if (kind === 1) {
@@ -580,6 +591,7 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     bones,
     rigids,
     faceMorphs,
+    allMorphs,
     indexByJp,
     envelopes,
     coreEnvelopes,
