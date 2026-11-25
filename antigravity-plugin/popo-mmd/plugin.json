@@ -1,10 +1,10 @@
 {
   "name": "popo-mmd",
   "displayName": "PoPo MMD Workbench",
-  "description": "MMD/PMX character motion authoring (MPL2), analytical IK, per-frame ground-bake critic, two-person duo alignment, and Blender mmd_tools hybrid workflow.",
+  "description": "Semantic-Kinematic MMD/PMX motion pipeline: automatic PMX Rig Profile re-modeling (multi-slice elliptical hulls, mesh-snapped surface anchors, 6-DOF palm basis, open-eye morph channels), continuous 30fps hybrid-dynamics solver (compile_motion_intent), per-frame kinematic/grounding gate, duo alignment, and Blender mmd_tools bridge.",
   "suggestedPrompts": [
-    "用 topaz 生成一段 3 次深蹲的 VMD 动作并检查贴地和分镜",
-    "用 topaz 和 caelus 编排一段面对面握手或击掌的双人交互动作",
-    "检查导出的 VMD 文件穿模与逐帧贴地情况"
+    "用 compile_motion_intent 为 topaz 生成一段害羞摸脸、左手叉腰再开心挥手的流畅动作，并导进 Blender 预览",
+    "用 compile_motion_intent 为 topaz 编排一段托下巴思考、蓄力欢呼再礼貌鞠躬的连续表演",
+    "分别给 topaz 和 caelus 生成同一套 MotionIntent 动作，对比贴地与穿模门禁"
   ]
 }

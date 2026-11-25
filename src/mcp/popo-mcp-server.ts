@@ -43,6 +43,8 @@ import { LEXICON, expandLexiconSegment } from "../lib/motion-lexicon.ts"
 import { critiquePoseVmd, parsePoseTextsAndTimeline } from "../lib/pose-critic.ts"
 import { auditVmd } from "../lib/pose-audit.ts"
 import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
+import { buildRigProfile } from "../lib/rig-profile.ts"
+import { solveMotionIntent, type MotionIntent } from "../lib/rig-solver.ts"
 import { renderPoseMultiViewPng, renderStoryboardPng, renderDuoMultiViewPng, renderDuoStoryboardPng } from "../lib/pose-renderer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
 import { measureGroundErrorVmd, summarizeGroundMeasure, type GroundMeasure } from "../lib/ground-bake.ts"
@@ -859,6 +861,26 @@ const TOOLS = [
         port: { type: "number", description: "Blender MCP socket port (default: BLENDER_PORT or 9876)" },
       },
       required: ["code"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "compile_motion_intent",
+    description:
+      "Compile a high-level beat-based MotionIntent JSON directly into a smooth, grounded .vmd using PoPo's Semantic-Kinematic Rig Profile (multi-slice elliptical hulls, mesh-snapped surface anchors, 6-DOF palm alignment, hybrid spring-damper dynamics, 2-bone Leg IK grounding, and 5-fingertip collision clamp). Much faster and more natural than raw FK MPL2.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intent: {
+          type: "object",
+          description: "MotionIntent JSON with beats: [{ at, effort?, stance?, spine?, hand_l?, hand_r?, gaze?, face? }]",
+        },
+        modelId: { type: "string", description: "Model id (default: topaz)" },
+        pmxPath: { type: "string", description: "Optional local .pmx path overriding modelId" },
+        outVmdPath: { type: "string", description: "Optional output .vmd path (default: .tmp/intent-motion.vmd)" },
+        rebuildProfile: { type: "boolean", description: "Force rebuild of <model>.rig-profile.json (default: false)" },
+      },
+      required: ["intent"],
       additionalProperties: false,
     },
   },
@@ -1785,6 +1807,64 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         {
           type: "text",
           text: JSON.stringify({ ok: true, endpoint, ...(typeof res === "object" && res ? res : { result: res }) }, null, 2),
+        },
+      ],
+    }
+  }
+
+  if (name === "compile_motion_intent") {
+    const { entry, bones } = loadModelFromArgs(args)
+    const intent = args.intent as MotionIntent
+    if (!intent || !Array.isArray(intent.beats) || intent.beats.length === 0) {
+      throw new Error("intent.beats must be a non-empty array")
+    }
+    const pmxAbs = entry.pmxPath ?? path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
+    const profilePath = path.join(path.dirname(pmxAbs), `${entry.id}.rig-profile.json`)
+    const rebuild = args.rebuildProfile === true
+    const profile = !rebuild && fs.existsSync(profilePath)
+      ? JSON.parse(fs.readFileSync(profilePath, "utf8"))
+      : (() => {
+          const built = buildRigProfile(bones, entry.id)
+          try { fs.writeFileSync(profilePath, JSON.stringify(built, null, 2)) } catch { /* ignore read-only */ }
+          return built
+        })()
+
+    const solved = solveMotionIntent(intent, profile, bones)
+    const outRel = typeof args.outVmdPath === "string" && args.outVmdPath.trim()
+      ? args.outVmdPath.trim()
+      : ".tmp/intent-motion.vmd"
+    const outAbs = path.resolve(ROOT_DIR, outRel)
+    fs.mkdirSync(path.dirname(outAbs), { recursive: true })
+    fs.writeFileSync(outAbs, solved.vmd)
+
+    const critic = critiquePoseVmd(bones, solved.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
+    const audit = auditVmd(solved.vmd, bones)
+    const ground = groundSummaryOf(bones, solved.vmd)
+    const ok = Boolean(critic?.passed && (!ground || ground.offendingFrames === 0))
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok,
+              modelId: entry.id,
+              profilePath,
+              vmdPath: outAbs,
+              vmdBytes: solved.vmd.byteLength,
+              durationSec: solved.durationSec,
+              frameCount: solved.frameCount,
+              decimatedKeyCount: solved.decimatedKeyCount,
+              morphKeyCount: solved.morphKeyCount,
+              solveTimeMs: solved.solveTimeMs,
+              critic,
+              audit,
+              groundContact: ground,
+            },
+            null,
+            2,
+          ),
         },
       ],
     }

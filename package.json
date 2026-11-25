@@ -6,7 +6,9 @@
     "dev": "next dev -p 4000",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:rig": "node scripts/test-rig-stress.ts",
+    "sync:plugin": "node scripts/sync-plugin.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "^8.11.0",
