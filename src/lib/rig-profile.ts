@@ -56,6 +56,10 @@ export interface ArmRig {
   wristTwistAxis?: V3
   /** Per-finger anatomical curl & spread axes derived from PMX localAxes or knuckle geometry */
   fingerAxes?: Record<string, FingerAxisSpec>
+  /** Sleeve-aware cross-sectional radius of upper arm (in u) */
+  upperArmRadius?: number
+  /** Sleeve-aware cross-sectional radius of forearm (in u) */
+  forearmRadius?: number
   /** Fraction of arm elevation automatically coupled to clavicle/shoulder */
   shoulderCoupling: number
 }
@@ -172,10 +176,10 @@ export interface GarmentProfile {
   headToBodyRatio: number
 }
 
-export const RIG_PROFILE_VERSION = "1.1" as const
+export const RIG_PROFILE_VERSION = "1.2" as const
 
 export interface RigProfile {
-  version: "1.0" | "1.1"
+  version: "1.0" | "1.1" | "1.2"
   modelId: string
   modelName: string
   measurements: ModelMeasurements
@@ -451,6 +455,17 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       }
     }
 
+    const armEnv = env[`${p}腕`]
+    const elbEnv = env[`${p}ひじ`]
+    const crossRadius = (e: typeof armEnv, fallback: number) => {
+      if (!e || e.count < 15) return fallback
+      const hy = (e.max[1] - e.min[1]) * 0.5
+      const hz = (e.max[2] - e.min[2]) * 0.5
+      return r2(Math.max(0.42, Math.min(0.72, Math.min(hy, hz) * 0.72)))
+    }
+    const upperArmRadius = crossRadius(armEnv, 0.56)
+    const forearmRadius = crossRadius(elbEnv, 0.46)
+
     return {
       side,
       shoulderJp: `${p}肩`,
@@ -466,6 +481,8 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       restForeDir: v3r(vNorm(foreVec)),
       restFingerDir: v3r(restFingerDir),
       restPalmNormal: v3r(restPalmNormal),
+      upperArmRadius,
+      forearmRadius,
       ...(getFixedAxis(armTwistJp) ? { armTwistAxis: getFixedAxis(armTwistJp) } : {}),
       ...(getFixedAxis(wristTwistJp) ? { wristTwistAxis: getFixedAxis(wristTwistJp) } : {}),
       ...(Object.keys(fingerAxes).length > 0 ? { fingerAxes } : {}),

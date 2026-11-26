@@ -67,7 +67,7 @@ Call **`popo-mmd.compile_motion_intent`** with `{ modelId, intent, outVmdPath }`
 
 ### Field Reference
 
-- **`secondaryPhysics`**: `true` (default, built-in Verlet hair/ribbon/skirt secondary spring simulation in VMD) or `false` (leave physics bones unkeyed when running Blender's native Bullet physics via `bpy.ops.mmd_tools.build_rig()`).
+- **`secondaryPhysics`**: `true` (default, `physicsMode: "baked_vmd"`, built-in Verlet hair/ribbon/skirt secondary spring simulation in VMD — do **not** run `bpy.ops.mmd_tools.build_rig()` in Blender) or `false` (`physicsMode: "blender_bullet"`, leave physics bones unkeyed for Blender's native Bullet physics via `bpy.ops.mmd_tools.build_rig()`).
 - **`effort`**: `"soft"` (gentle smooth), `"snappy"` (crisp fast-out), `"bouncy"` (playful elastic), `"heavy"` (weighted anticipation).
 - **`passThrough`**: `true` for continuous mid-motion beats (no dead-stop); beats `≤ 0.65s` apart auto-enable pass-through.
 - **`stance`**:

@@ -504,8 +504,7 @@ export function analyzeDuoSequence(
     frameList = [...new Set(sampleTimes.map((t) => Math.max(0, Math.min(maxFrame, Math.round(t * 30)))))].sort((a, b) => a - b)
   } else {
     frameList = []
-    for (let f = 0; f <= maxFrame; f += 2) frameList.push(f)
-    if (frameList[frameList.length - 1] !== maxFrame) frameList.push(maxFrame)
+    for (let f = 0; f <= maxFrame; f++) frameList.push(f)
   }
 
   const allFrames: DuoFrameMetrics[] = []

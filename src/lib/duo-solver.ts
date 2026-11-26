@@ -23,6 +23,7 @@ import {
   type MotionBeat,
   type MotionIntent,
   type RigSolveResult,
+  type SceneObstacle,
   type WorldHull,
 } from "./rig-solver.ts"
 
@@ -65,6 +66,8 @@ export interface DuoMotionIntent {
   breathing?: boolean
   autoBlink?: boolean
   secondaryPhysics?: boolean
+  /** Optional static scene collision capsules in shared duo world space */
+  obstacles?: SceneObstacle[]
   actors: {
     A: { modelId?: string; pmxPath?: string; placement: DuoPlacement }
     B: { modelId?: string; pmxPath?: string; placement: DuoPlacement }
@@ -218,35 +221,89 @@ export function solveDuoMotionIntent(
   actorBInput: DuoSolveActorInput,
 ): DuoSolveResult {
   const tStart = performance.now()
-  const fps = duoIntent.fps ?? 30
+  if (duoIntent.fps != null && duoIntent.fps !== 30) {
+    throw new Error(`VMD output requires fps=30 (got ${duoIntent.fps})`)
+  }
+  const fps = 30
   const beats = [...duoIntent.beats].sort((a, b) => a.at - b.at)
   if (beats.length === 0) throw new Error("DuoMotionIntent must contain at least one beat")
+
+  const VALID_GAZE_PARTS = new Set(["head", "hand_l", "hand_r"])
+  const VALID_CONTACT_TYPES = new Set(["hold_hands", "high_five", "pat_shoulder", "hand_on_waist"])
+  for (const b of beats) {
+    for (const sideKey of ["A", "B"] as const) {
+      const sb = b[sideKey]
+      if (!sb) continue
+      for (const hKey of ["hand_l", "hand_r"] as const) {
+        const tgt = sb[hKey]?.target
+        if (typeof tgt === "string" && tgt.startsWith("partner:")) {
+          const part = tgt.slice(8)
+          if (!(part in PARTNER_BONE_MAP)) {
+            throw new Error(`Unknown partner target "${tgt}" on ${sideKey}.${hKey}. Valid parts: ${Object.keys(PARTNER_BONE_MAP).join(", ")}`)
+          }
+        }
+      }
+      const gt = sb.gaze?.target
+      if (typeof gt === "string" && gt.startsWith("partner:")) {
+        const part = gt.slice(8)
+        if (!VALID_GAZE_PARTS.has(part)) {
+          throw new Error(`Unknown partner gaze target "${gt}" on ${sideKey}. Valid gaze parts: head, hand_l, hand_r`)
+        }
+      }
+    }
+    if (b.contacts) {
+      for (const c of b.contacts) {
+        if (!VALID_CONTACT_TYPES.has(c.type)) {
+          throw new Error(`Unknown contact type "${c.type}". Valid types: ${[...VALID_CONTACT_TYPES].join(", ")}`)
+        }
+        if ((c.from?.actor !== "A" && c.from?.actor !== "B") || (c.to?.actor !== "A" && c.to?.actor !== "B")) {
+          throw new Error(`Invalid contact actor in ${JSON.stringify(c)} (must be "A" or "B")`)
+        }
+        if (c.from?.hand !== "l" && c.from?.hand !== "r") {
+          throw new Error(`Invalid contact hand "${c.from?.hand}" (must be "l" or "r")`)
+        }
+        if (!(c.to?.part in PARTNER_BONE_MAP)) {
+          throw new Error(`Unknown contact target part "${c.to?.part}". Valid parts: ${Object.keys(PARTNER_BONE_MAP).join(", ")}`)
+        }
+      }
+    }
+  }
 
   const durationSec = Math.max(0.5, beats[beats.length - 1].at)
   const totalFrames = Math.max(1, Math.round(durationSec * fps))
 
   // Build synchronized single-actor MotionIntents sharing exact beat timestamps
-  const toSingleIntent = (which: "A" | "B"): MotionIntent => ({
-    title: `${duoIntent.title ?? "Duo"} (${which})`,
-    fps,
-    breathing: duoIntent.breathing,
-    autoBlink: duoIntent.autoBlink,
-    secondaryPhysics: duoIntent.secondaryPhysics,
-    beats: beats.map((b) => {
-      const sideBeat = b[which] ?? {}
-      return {
-        at: b.at,
-        effort: sideBeat.effort ?? b.effort ?? "soft",
-        passThrough: sideBeat.passThrough ?? b.passThrough,
-        stance: sideBeat.stance,
-        spine: sideBeat.spine,
-        hand_l: sideBeat.hand_l,
-        hand_r: sideBeat.hand_r,
-        gaze: sideBeat.gaze,
-        face: sideBeat.face,
-      }
-    }),
-  })
+  const toSingleIntent = (which: "A" | "B"): MotionIntent => {
+    const pBase = which === "A" ? actorAInput.placement : actorBInput.placement
+    const localObstacles = duoIntent.obstacles?.map((ob) => ({
+      id: ob.id,
+      a: worldToLocal(ob.a, pBase),
+      b: worldToLocal(ob.b, pBase),
+      radius: ob.radius,
+    }))
+    return {
+      title: `${duoIntent.title ?? "Duo"} (${which})`,
+      fps,
+      breathing: duoIntent.breathing,
+      autoBlink: duoIntent.autoBlink,
+      secondaryPhysics: duoIntent.secondaryPhysics,
+      ...(localObstacles ? { obstacles: localObstacles } : {}),
+      beats: beats.map((b) => {
+        const sideBeat = b[which] ?? {}
+        return {
+          at: b.at,
+          effort: sideBeat.effort ?? b.effort ?? "soft",
+          passThrough: sideBeat.passThrough ?? b.passThrough,
+          stance: sideBeat.stance,
+          spine: sideBeat.spine,
+          hand_l: sideBeat.hand_l,
+          hand_r: sideBeat.hand_r,
+          gaze: sideBeat.gaze,
+          face: sideBeat.face,
+        }
+      }),
+    }
+  }
 
   const intentA = toSingleIntent("A")
   const intentB = toSingleIntent("B")
@@ -319,9 +376,13 @@ export function solveDuoMotionIntent(
       radiusB: h.radiusB,
       slices: h.slices,
     }))
-    // Also inject partner upper-arm capsules so reaching hands/forearms never slice through partner shoulders/upper arms
+    // Also inject partner upper-arm capsules using real sleeve-aware radii from RigProfile
+    const partnerProfile = partnerWhich === "A" ? actorAInput.profile : actorBInput.profile
     const idZero = { x: 0, y: 0, z: 0, w: 1 }
     for (const side of ["左", "右"] as const) {
+      const sKey = side === "左" ? "l" : "r"
+      const upperR = partnerProfile.arms[sKey]?.upperArmRadius ?? 0.56
+      const foreR = partnerProfile.arms[sKey]?.forearmRadius ?? 0.46
       const armIdx = partnerBones.indexByJp.get(`${side}腕`)
       const elbIdx = partnerBones.indexByJp.get(`${side}ひじ`)
       if (armIdx != null && elbIdx != null) {
@@ -331,13 +392,13 @@ export function solveDuoMotionIntent(
           const aLoc = worldToLocal(localToWorld(aPos, pPartner), pSelf)
           const bLoc = worldToLocal(localToWorld(ePos, pPartner), pSelf)
           out.push({
-            id: `partner_upper_${side === "左" ? "l" : "r"}`,
+            id: `partner_upper_${sKey}`,
             bonePos: aLoc,
             boneRot: idZero,
             a: aLoc,
             b: bLoc,
-            radiusA: 0.48,
-            radiusB: 0.42,
+            radiusA: upperR,
+            radiusB: foreR,
           })
         }
       }
@@ -370,20 +431,25 @@ export function solveDuoMotionIntent(
     const pSelf = selfWhich === "A" ? actorAInput.placement : actorBInput.placement
     const pPartner = partnerWhich === "A" ? actorAInput.placement : actorBInput.placement
 
-    const resolveDynamicHand = (frame: number, side: "l" | "r", timeSec: number) => {
+    const resolveDynamicHand = (frame: number, side: "l" | "r", timeSec: number, beatAtSec?: number) => {
       const pRec = partnerCache.get(frame)
       if (!pRec) return null
       const { a, b, t } = sampleDuoBeat(timeSec)
+      // When called for a specific beat endpoint (resPrev/resA/resB/resNext), evaluate ONLY that beat
+      // so rest->partner transitions interpolate smoothly along the outward-upward detour arc!
+      const refBeat = beatAtSec != null
+        ? (beats.find((bt) => Math.abs(bt.at - beatAtSec) < 1e-4) ?? b)
+        : null
 
-      // 1) Check declarative contacts on beat a / b (smoothly blended by t)
+      // 1) Check declarative contacts
       const findContact = (bt: DuoBeat) =>
         bt.contacts?.find((c) => c.from.actor === selfWhich && c.from.hand === side) ??
         bt.contacts?.find((c) => (c.type === "hold_hands" || c.type === "high_five") && c.to.actor === selfWhich && c.to.part === `hand_${side}`)
-      const cA = findContact(a)
-      const cB = findContact(b)
-      const activeC = cB ?? cA
+      const activeC = refBeat ? findContact(refBeat) : (findContact(b) ?? findContact(a))
       if (activeC) {
-        const wContact = (cA && cB ? 1.0 : cB ? t : 1 - t) * (activeC.strength ?? 1.0)
+        const wContact = refBeat
+          ? (activeC.strength ?? 1.0)
+          : ((findContact(a) && findContact(b) ? 1.0 : findContact(b) ? t : 1 - t) * (activeC.strength ?? 1.0))
         if (wContact > 0.25) {
           const isMutualHand = activeC.type === "hold_hands" || activeC.type === "high_five"
           const targetPart: DuoPartnerPart = activeC.from.actor === selfWhich
@@ -426,6 +492,18 @@ export function solveDuoMotionIntent(
       const hB = b[selfWhich]?.[side === "l" ? "hand_l" : "hand_r"]
       const pickTarget = (h: MotionBeat["hand_l"] | undefined) =>
         typeof h?.target === "string" && h.target.startsWith("partner:") ? h.target.slice(8) as DuoPartnerPart : null
+      if (refBeat) {
+        const pRef = pickTarget(refBeat[selfWhich]?.[side === "l" ? "hand_l" : "hand_r"])
+        if (!pRef) return null
+        const infoRef = getPartnerPartWorld(pRef, partnerBones, pRec.fk, pPartner)
+        if (!infoRef) return null
+        return {
+          localTarget: worldToLocal(infoRef.worldPos, pSelf),
+          localNormal: dirWorldToLocal(infoRef.worldNormal, pSelf.yawDeg),
+          palmMode: "surface",
+          endEffector: (pRef === "cheek_l" || pRef === "cheek_r") ? "fingertip" as const : "palm" as const,
+        }
+      }
       const pA = pickTarget(hA)
       const pB = pickTarget(hB)
       if (!pA && !pB) return null

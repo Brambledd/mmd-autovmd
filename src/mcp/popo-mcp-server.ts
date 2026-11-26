@@ -129,11 +129,18 @@ function resolveModelEntry(modelId?: string, pmxPath?: string): ResolvedModelEnt
     }
   }
   const all = scanPublicModels()
+  if (typeof modelId === "string" && modelId.length > 0 && !modelId.trim()) {
+    throw new Error(`Invalid blank modelId. Available models: ${all.map((m) => m.id).join(", ")}`)
+  }
   const id = (modelId || "topaz").trim()
-  return (
-    all.find((m) => m.id === id || m.label === id) ??
-    all[0]
-  )
+  const found = all.find((m) => m.id === id || m.label === id)
+  if (!found) {
+    if (modelId && modelId.trim()) {
+      throw new Error(`Unknown modelId "${id}". Available models: ${all.map((m) => m.id).join(", ")}`)
+    }
+    return all[0]
+  }
+  return found
 }
 
 function loadModelSync(modelId?: string, pmxPath?: string): { entry: ResolvedModelEntry; bones: PmxBones } {
@@ -347,9 +354,21 @@ function describeGroundEn(fin: FinalizeResult): string {
 }
 
 /** 外部 VMD（无 MPL 源）的逐帧贴地摘要。 */
-function groundSummaryOf(bones: PmxBones, vmd: Uint8Array) {
+function groundSummaryOf(bones: PmxBones, vmd: Uint8Array, allowSingleFootStep = false) {
   const m = measureGroundErrorVmd(vmd, bones)
-  return m ? summarizeGroundMeasure(m) : null
+  if (!m) return null
+  const summary = summarizeGroundMeasure(m)
+  if (!allowSingleFootStep) return summary
+  let walkOffending = 0
+  const tol = m.tolerance
+  for (let f = 0; f < m.error.l.length; f++) {
+    const el = m.error.l[f]
+    const er = m.error.r[f]
+    const sunk = el < -tol || er < -tol
+    const bothFloating = el > tol && er > tol
+    if (sunk || bothFloating) walkOffending++
+  }
+  return { ...summary, offendingFrames: walkOffending }
 }
 
 /**
@@ -874,7 +893,7 @@ const TOOLS = [
       properties: {
         intent: {
           type: "object",
-          description: "MotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, beats: [{ at, effort?, passThrough?, stance?, spine?, hand_l?, hand_r?, gaze?, face? }] }",
+          description: "MotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, obstacles?: [{ id?, a: [x,y,z], b: [x,y,z], radius }], beats: [{ at, effort?, passThrough?, stance?, spine?, hand_l?, hand_r?, gaze?, face? }] }",
         },
         modelId: { type: "string", description: "Model id (default: topaz)" },
         pmxPath: { type: "string", description: "Optional local .pmx path overriding modelId" },
@@ -909,7 +928,7 @@ const TOOLS = [
       properties: {
         intent: {
           type: "object",
-          description: "DuoMotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, leadActor?: 'A'|'B', actors: { A: { modelId?, pmxPath?, placement: { offset, yawDeg } }, B: { ... } }, beats: [{ at, effort?, passThrough?, A?, B?, placementA?, placementB?, contacts? }] }",
+          description: "DuoMotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, obstacles?: [{ id?, a: [x,y,z], b: [x,y,z], radius }], leadActor?: 'A'|'B', actors: { A: { modelId?, pmxPath?, placement: { offset, yawDeg } }, B: { ... } }, beats: [{ at, effort?, passThrough?, A?, B?, placementA?, placementB?, contacts? }] }",
         },
         outDir: { type: "string", description: "Output directory for actorA.vmd & actorB.vmd (default: .tmp/duo/<timestamp>)" },
         rebuildProfile: { type: "boolean", description: "Force rebuild of <model>.rig-profile.json (default: false)" },
@@ -1848,6 +1867,36 @@ function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebui
   return { profile: built, profilePath, pmxAbs }
 }
 
+function buildIntentCriticContext(
+  beats: Array<{ at: number; hand_l?: { target?: unknown }; hand_r?: { target?: unknown } }>,
+  raisedContactsAt?: Set<number>,
+): string {
+  const isRaised = (t: unknown) =>
+    typeof t === "string" && /^(wave_|cheer_|forehead|head_top|partner:head|salute)/i.test(t)
+  const poses: string[] = []
+  const animLines: string[] = []
+  for (let i = 0; i < beats.length; i++) {
+    const b = beats[i]
+    const contactRaised = Boolean(raisedContactsAt?.has(b.at))
+    const lRaised = isRaised(b.hand_l?.target) || contactRaised
+    const rRaised = isRaised(b.hand_r?.target) || contactRaised
+    const body: string[] = []
+    if (lRaised) body.push("  reach hand_l to wave;")
+    if (rRaised) body.push("  reach hand_r to wave;")
+    if (body.length > 0) {
+      const pname = `b_${i}`
+      poses.push(`@pose ${pname} {\n${body.join("\n")}\n}`)
+      animLines.push(`  ${Number(b.at.toFixed(2))}: ${pname};`)
+    } else if (i === 0 || i === beats.length - 1) {
+      const pname = `s_${i}`
+      poses.push(`@pose ${pname} {\n  reset;\n}`)
+      animLines.push(`  ${Number(b.at.toFixed(2))}: ${pname};`)
+    }
+  }
+  if (poses.length === 0) return ""
+  return `${poses.join("\n\n")}\n\n@animation main {\n${animLines.join("\n")}\n}`
+}
+
   if (name === "compile_motion_intent") {
     const { entry, bones } = loadModelFromArgs(args)
     const intent = args.intent as MotionIntent
@@ -1864,7 +1913,12 @@ function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebui
     fs.mkdirSync(path.dirname(outAbs), { recursive: true })
     fs.writeFileSync(outAbs, solved.vmd)
 
-    const critic = critiquePoseVmd(bones, solved.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
+    const critic = critiquePoseVmd(
+      bones,
+      solved.vmd,
+      buildIntentCriticContext(intent.beats),
+      [{ index: 0, start: 0, end: solved.durationSec }],
+    )
     const audit = auditVmd(solved.vmd, bones)
     const ground = groundSummaryOf(bones, solved.vmd)
     const ok = Boolean(critic?.passed && (!ground || ground.offendingFrames === 0))
@@ -1877,6 +1931,7 @@ function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebui
             {
               ok,
               modelId: entry.id,
+              physicsMode: intent.secondaryPhysics === false ? "blender_bullet" : "baked_vmd",
               profilePath,
               vmdPath: outAbs,
               vmdBytes: solved.vmd.byteLength,
@@ -1937,10 +1992,28 @@ function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebui
     fs.writeFileSync(vmdPathA, solved.actorA.vmd)
     fs.writeFileSync(vmdPathB, solved.actorB.vmd)
 
-    const criticA = critiquePoseVmd(sideA.bones, solved.actorA.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
-    const criticB = critiquePoseVmd(sideB.bones, solved.actorB.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
-    const groundA = groundSummaryOf(sideA.bones, solved.actorA.vmd)
-    const groundB = groundSummaryOf(sideB.bones, solved.actorB.vmd)
+    const raisedContactsAt = new Set<number>()
+    for (const b of intent.beats) {
+      if (b.contacts?.some((c) => c.type === "high_five" || c.type === "pat_shoulder")) {
+        raisedContactsAt.add(b.at)
+      }
+    }
+    const criticA = critiquePoseVmd(
+      sideA.bones,
+      solved.actorA.vmd,
+      buildIntentCriticContext(intent.beats.map((b) => ({ at: b.at, ...(b.A ?? {}) })), raisedContactsAt),
+      [{ index: 0, start: 0, end: solved.durationSec }],
+    )
+    const criticB = critiquePoseVmd(
+      sideB.bones,
+      solved.actorB.vmd,
+      buildIntentCriticContext(intent.beats.map((b) => ({ at: b.at, ...(b.B ?? {}) })), raisedContactsAt),
+      [{ index: 0, start: 0, end: solved.durationSec }],
+    )
+    const hasWalkA = intent.beats.some((b) => b.placementA != null)
+    const hasWalkB = intent.beats.some((b) => b.placementB != null)
+    const groundA = groundSummaryOf(sideA.bones, solved.actorA.vmd, hasWalkA)
+    const groundB = groundSummaryOf(sideB.bones, solved.actorB.vmd, hasWalkB)
 
     const prepA = prepareDuoActor({ label: "A", bones: sideA.bones, vmd: solved.actorA.vmd, placement: sideA.placement }, "A")
     const prepB = prepareDuoActor({ label: "B", bones: sideB.bones, vmd: solved.actorB.vmd, placement: sideB.placement }, "B")
@@ -1974,6 +2047,7 @@ function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebui
       type: "text",
       text: stringifyReport({
         ok,
+        physicsMode: intent.secondaryPhysics === false ? "blender_bullet" : "baked_vmd",
         durationSec: solved.durationSec,
         frameCount: solved.frameCount,
         syncContactTimes: solved.syncContactTimes,

@@ -79,6 +79,13 @@ export interface MotionBeat {
   face?: Record<string, number>
 }
 
+export interface SceneObstacle {
+  id?: string
+  a: V3
+  b: V3
+  radius: number
+}
+
 export interface MotionIntent {
   title?: string
   fps?: number
@@ -88,6 +95,8 @@ export interface MotionIntent {
   autoBlink?: boolean
   /** Lightweight acceleration-driven secondary spring physics for hair/ribbons/skirts (default true; set false if using native Blender Bullet physics) */
   secondaryPhysics?: boolean
+  /** Optional static scene collision capsules (e.g. chairs, tables, walls) in model/world space */
+  obstacles?: SceneObstacle[]
   beats: MotionBeat[]
 }
 
@@ -623,6 +632,7 @@ export interface SolveMotionIntentOptions {
     frame: number,
     side: "l" | "r",
     timeSec: number,
+    beatAtSec?: number,
   ) => {
     localTarget: V3
     localNormal?: V3
@@ -654,7 +664,10 @@ export function solveMotionIntent(
   options?: SolveMotionIntentOptions,
 ): RigSolveResult {
   const tStart = performance.now()
-  const fps = intent.fps ?? 30
+  if (intent.fps != null && intent.fps !== 30) {
+    throw new Error(`VMD output requires fps=30 (got ${intent.fps})`)
+  }
+  const fps = 30
   const dt = 1 / fps
   const beats = [...intent.beats].sort((a, b) => a.at - b.at)
   if (beats.length === 0) throw new Error("MotionIntent must contain at least one beat")
@@ -799,6 +812,33 @@ export function solveMotionIntent(
     }
   }
 
+  // Precompute dynamic root velocity & walk-cycle phase when rootLocalTransform is provided
+  const walkAmpByFrame = new Float32Array(totalFrames + 1)
+  const walkPhaseByFrame = new Float32Array(totalFrames + 1)
+  if (options?.rootLocalTransform) {
+    const roots = Array.from({ length: totalFrames + 1 }, (_, f) => options.rootLocalTransform!(f, f * dt))
+    let phase = 0
+    for (let f = 0; f <= totalFrames; f++) {
+      const prev = roots[Math.max(0, f - 1)]
+      const next = roots[Math.min(totalFrames, f + 1)]
+      const spanDt = (Math.min(totalFrames, f + 1) - Math.max(0, f - 1)) * dt
+      if (prev && next && spanDt > 1e-5) {
+        const horizSpeed = Math.hypot(next.pos[0] - prev.pos[0], next.pos[2] - prev.pos[2]) / spanDt
+        const yawSpeed = Math.abs(next.yawDeg - prev.yawDeg) / spanDt
+        const rawAmp = Math.max(
+          horizSpeed > 0.5 ? Math.min(1, (horizSpeed - 0.5) / 2.0) : 0,
+          yawSpeed > 12 ? Math.min(0.7, (yawSpeed - 12) / 45) : 0,
+        )
+        const edgeFade = Math.min(1, f / 6, (totalFrames - f) / 6)
+        walkAmpByFrame[f] = rawAmp * edgeFade
+        if (walkAmpByFrame[f] > 0.02) {
+          phase += 2 * Math.PI * 1.75 * dt
+        }
+      }
+      walkPhaseByFrame[f] = phase
+    }
+  }
+
   // ---- Per-frame 30fps continuous solve loop ----
   for (let frame = 0; frame <= totalFrames; frame++) {
     const timeSec = frame * dt
@@ -910,7 +950,12 @@ export function solveMotionIntent(
       const hipParentRot = hipParentIdx >= 0 ? (fk.rot.get(hipParentIdx) ?? IDENTITY) : IDENTITY
 
       const soleBiasY = Math.abs(leg.restFootMinY) <= 0.25 ? -leg.restFootMinY : 0
-      const baseAnkle: V3 = [leg.restAnklePos[0], leg.restAnklePos[1] + soleBiasY, leg.restAnklePos[2]]
+      const walkAmp = walkAmpByFrame[frame] ?? 0
+      const walkSin = Math.sin(walkPhaseByFrame[frame] ?? 0)
+      const stepLiftY = walkAmp > 0.02
+        ? Math.max(0, (side === "l" ? 1 : -1) * walkSin) * walkAmp * 0.52
+        : 0
+      const baseAnkle: V3 = [leg.restAnklePos[0], leg.restAnklePos[1] + soleBiasY + stepLiftY, leg.restAnklePos[2]]
       const targetAnkle: V3 = rootDyn
         ? vAdd(qRotate(qRootDyn, baseAnkle), rootDyn.pos)
         : baseAnkle
@@ -1007,6 +1052,20 @@ export function solveMotionIntent(
     }).filter((c): c is NonNullable<typeof c> => c !== null)
     const extHulls = options?.externalWorldHulls?.(frame, timeSec) ?? []
     for (const eh of extHulls) worldHulls.push(eh)
+    if (intent.obstacles && intent.obstacles.length > 0) {
+      for (let oi = 0; oi < intent.obstacles.length; oi++) {
+        const ob = intent.obstacles[oi]
+        worldHulls.push({
+          id: ob.id ? `obstacle_${ob.id}` : `obstacle_${oi}`,
+          bonePos: ob.a,
+          boneRot: IDENTITY,
+          a: ob.a,
+          b: ob.b,
+          radiusA: ob.radius,
+          radiusB: ob.radius,
+        })
+      }
+    }
 
     const FACE_ANCHORS = new Set(["cheek_l", "cheek_r", "mouth", "chin", "forehead"])
     const WAIST_ANCHORS = new Set(["waist_side_l", "waist_side_r", "hip_side_l", "hip_side_r"])
@@ -1021,14 +1080,19 @@ export function solveMotionIntent(
         else if (WAIST_ANCHORS.has(targetName)) hint = [-sSign * 0.25, -0.50, -0.82]
         else hint = [-sSign * 0.85, 0.45, 0.05]
       } else if (palmMode === "camera") {
-        palmN = [0, 0, -1]
+        palmN = rootDyn ? qRotate(qRootDyn, [0, 0, -1]) : [0, 0, -1]
         hint = [0, 1, 0]
       } else if (palmMode === "inward") {
-        palmN = [-sSign, 0, 0]
+        palmN = rootDyn ? qRotate(qRootDyn, [-sSign, 0, 0]) : [-sSign, 0, 0]
         hint = [0, 1, 0]
       } else if (palmMode === "down") {
         palmN = [0, -1, 0]
-        hint = [0, 0, -1]
+        hint = rootDyn ? qRotate(qRootDyn, [0, 0, -1]) : [0, 0, -1]
+      } else if (rootDyn) {
+        palmN = qRotate(qRootDyn, palmN)
+      }
+      if (palmMode === "surface" && rootDyn) {
+        hint = qRotate(qRootDyn, hint)
       }
       const d = vDot(hint, palmN)
       const f = vSub(hint, vScale(palmN, d))
@@ -1036,7 +1100,7 @@ export function solveMotionIntent(
     }
 
     // Helper: resolve semantic anchor to exact wrist-target world position via Exact End-Effector Inverse
-    const resolveHandTarget = (intentHand: HandIntent | undefined, side: "l" | "r"): {
+    const resolveHandTarget = (intentHand: HandIntent | undefined, side: "l" | "r", beatAtSec?: number): {
       active: boolean
       pos: V3
       surfacePos: V3
@@ -1049,7 +1113,7 @@ export function solveMotionIntent(
       const palmLen = arm.palmLen ?? 0.85
       const sSign = side === "l" ? 1 : -1
 
-      const dynOv = options?.overrideHandTarget?.(frame, side, timeSec)
+      const dynOv = options?.overrideHandTarget?.(frame, side, timeSec, beatAtSec)
       if (dynOv) {
         const worldNormal: V3 = dynOv.localNormal ? vNorm(dynOv.localNormal) : [0, 0, -1]
         const palmMode = dynOv.palmMode ?? intentHand?.palm ?? "surface"
@@ -1137,12 +1201,16 @@ export function solveMotionIntent(
     const solvedArmObstacles: WorldHull[] = [] // enables Arm-L <-> Arm-R mutual collision!
 
     const computePoleFor = (res: ReturnType<typeof resolveHandTarget>, armPosRef: V3, sSign: number): V3 => {
-      if (!res.active) return vNorm([sSign * 0.32, -1.0, 0.25])
-      if (res.arc === "akimbo") return vNorm([sSign * 1.15, -0.15, 0.38])
-      const highReach = res.pos[1] > armPosRef[1] + 0.3
-      const poleX = res.arc === "outward" ? sSign * (highReach ? 0.42 : 0.78) : res.arc === "inward" ? sSign * 0.15 : sSign * 0.42
-      const poleY = highReach ? -1.65 : -0.95
-      return vNorm([poleX, poleY, highReach ? 0.18 : 0.38])
+      let basePole: V3
+      if (!res.active) basePole = vNorm([sSign * 0.32, -1.0, 0.25])
+      else if (res.arc === "akimbo") basePole = vNorm([sSign * 1.15, -0.15, 0.38])
+      else {
+        const highReach = res.pos[1] > armPosRef[1] + 0.3
+        const poleX = res.arc === "outward" ? sSign * (highReach ? 0.42 : 0.78) : res.arc === "inward" ? sSign * 0.15 : sSign * 0.42
+        const poleY = highReach ? -1.65 : -0.95
+        basePole = vNorm([poleX, poleY, highReach ? 0.18 : 0.38])
+      }
+      return rootDyn ? vNorm(qRotate(qRootDyn, basePole)) : basePole
     }
 
     for (const side of ["l", "r"] as const) {
@@ -1153,10 +1221,10 @@ export function solveMotionIntent(
       const hB = pickHand(sArm.b)
       const hNext = pickHand(sArm.next)
 
-      const resPrev = resolveHandTarget(hPrev, side)
-      const resA = resolveHandTarget(hA, side)
-      const resB = resolveHandTarget(hB, side)
-      const resNext = resolveHandTarget(hNext, side)
+      const resPrev = resolveHandTarget(hPrev, side, sArm.prev.at)
+      const resA = resolveHandTarget(hA, side, sArm.a.at)
+      const resB = resolveHandTarget(hB, side, sArm.b.at)
+      const resNext = resolveHandTarget(hNext, side, sArm.next.at)
 
       const tArm = sArm.t
       const tHand = sHand.t
@@ -1198,9 +1266,13 @@ export function solveMotionIntent(
         if (sArm.passThrough && resA.active && resB.active) {
           targetPos = catmullRomV3(resPrev.pos, resA.pos, resB.pos, resNext.pos, sArm.rawT)
         } else {
-          // Outward-forward arc bulge keeps sweeping arms curving gracefully around torso
-          const outwardArcDir = vNorm([sSign * 0.72, 0.12, -0.68])
-          const bulge = (isFaceA || isFaceB || isWaistA || isWaistB) ? 0.14 : 0.16
+          // Outward-forward arc bulge keeps sweeping arms curving gracefully around self & partner
+          const nearPartner = extHulls.length > 0 && (resA.targetName === "partner" || resB.targetName === "partner")
+          const rawArcDir: V3 = nearPartner
+            ? vNorm([sSign * 0.65, 0.72, -0.25])
+            : vNorm([sSign * 0.72, 0.12, -0.68])
+          const outwardArcDir = rootDyn ? qRotate(qRootDyn, rawArcDir) : rawArcDir
+          const bulge = nearPartner ? 0.38 : (isFaceA || isFaceB || isWaistA || isWaistB) ? 0.14 : 0.16
           targetPos = slerpAroundPivot(shoulderWorld, resA.pos, resB.pos, tArm, outwardArcDir, bulge)
         }
 
@@ -1691,7 +1763,12 @@ export function solveMotionIntent(
   // ---- Decimate & Serialize to VMD ----
   let rawKeyCount = 0
   const boneKeys: BoneKey[] = []
+  const seenVmdNames = new Set<string>()
   for (const [jp, rawSamples] of tracks.entries()) {
+    const nameBytes = encodeBoneName(jp)
+    const sig = Array.from(nameBytes).join(",")
+    if (seenVmdNames.has(sig)) continue // prevent 15-byte Shift-JIS truncation collisions from overwriting tracks
+    seenVmdNames.add(sig)
     rawKeyCount += rawSamples.length
     const isPhys = physBoneSet.has(jp)
     const samples = GROUND_LOCKED_BONES.has(jp)
@@ -1699,7 +1776,6 @@ export function solveMotionIntent(
       : smoothQuatTrack(rawSamples, 2)
     // Secondary physics chains use 1.4° angle tolerance to keep VMD compact & silky
     const kept = decimateTrack(samples, isPhys ? 1.4 : 0.25, 0.008)
-    const nameBytes = encodeBoneName(jp)
     for (const s of kept) {
       boneKeys.push({
         frame: s.frame,

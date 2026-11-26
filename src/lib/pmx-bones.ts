@@ -548,12 +548,53 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     }
   }
 
-  // Extract 4-slice axial elliptical hulls for core anatomical bones (captures true elliptical waist/hips/chest/head/legs!)
+  // Extract 4-slice axial elliptical hulls for core anatomical bones (including D-chain / positive-grant visual bones!)
   const SLICE_BONES = ["頭", "上半身2", "上半身", "下半身", "左足", "右足", "左ひざ", "右ひざ"]
   const sliceBoneIndices = new Map<number, string>()
   for (const jp of SLICE_BONES) {
     const idx = indexByJp.get(jp)
     if (idx != null) sliceBoneIndices.set(idx, jp)
+  }
+  // Map D-chain / positive-grant visual bones (e.g. 左足D -> 左足, 左ひざD -> 左ひざ) to their core control bone
+  for (let i = 0; i < bones.length; i++) {
+    if (sliceBoneIndices.has(i)) continue
+    const b = bones[i]
+    if (b.grant && b.grant.ratio > 0.5 && sliceBoneIndices.has(b.grant.parent)) {
+      sliceBoneIndices.set(i, sliceBoneIndices.get(b.grant.parent)!)
+    } else if (b.jp.endsWith("D")) {
+      const baseJp = b.jp.slice(0, -1)
+      const baseIdx = indexByJp.get(baseJp)
+      if (baseIdx != null && sliceBoneIndices.has(baseIdx)) {
+        sliceBoneIndices.set(i, baseJp)
+      }
+    }
+  }
+  // Merge grant/auxiliary arm-twist/sleeve vertices into 左腕/右腕/左ひじ/右ひじ envelopes for sleeve-aware radii
+  const ARM_CORE_JPS = ["左腕", "右腕", "左ひじ", "右ひじ"] as const
+  const armAliasMap = new Map<number, string>()
+  for (const jp of ARM_CORE_JPS) {
+    const idx = indexByJp.get(jp)
+    if (idx != null) armAliasMap.set(idx, jp)
+  }
+  for (let i = 0; i < bones.length; i++) {
+    if (armAliasMap.has(i)) continue
+    const b = bones[i]
+    if (b.grant && b.grant.ratio > 0.1 && armAliasMap.has(b.grant.parent)) {
+      armAliasMap.set(i, armAliasMap.get(b.grant.parent)!)
+    } else if (/^(左|右)(腕捩|手捩|ひじ補助)/.test(b.jp)) {
+      const side = b.jp[0]
+      const target = b.jp.includes("腕") ? `${side}腕` : `${side}ひじ`
+      if (indexByJp.has(target)) armAliasMap.set(i, target)
+    }
+  }
+  for (let i = 0; i < vCount; i++) {
+    const armJp = armAliasMap.get(vBone[i])
+    if (!armJp) continue
+    const bIdx = indexByJp.get(armJp)!
+    const bone = bones[bIdx]
+    const x = vPos[i * 3], y = vPos[i * 3 + 1], z = vPos[i * 3 + 2]
+    const d = Math.hypot(x - bone.pos[0], y - bone.pos[1], z - bone.pos[2])
+    accEnv(envelopes, armJp, x, y, z, d)
   }
   const vertsBySliceBone = new Map<string, Array<[number, number, number]>>()
   for (let i = 0; i < vCount; i++) {
