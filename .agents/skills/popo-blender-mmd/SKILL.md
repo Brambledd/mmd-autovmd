@@ -232,4 +232,8 @@ assert os.path.exists(FINAL_VMD_PATH) and os.path.getsize(FINAL_VMD_PATH) > 0
 
 - **Verify external/exported `.vmd`**: Call `popo-mmd.inspect_vmd_file` (`vmdPath`, `modelId`, optional `renderViews: true`) to confirm `ok: true`, `critic.passed: true`, and `groundContact.offendingFrames: 0`.
 - **PoPo 3D Web Stage (optional)**: If `http://127.0.0.1:4000` is running (`npm run dev`), call `popo-mmd.push_vmd_to_stage` with `vmdPath`, `modelId`, and `title`.
-- **Two-Person Duo Scenes**: Compile Actor A and Actor B independently with `compile_motion_intent`, verify world spacing/contact with `popo-mmd.inspect_duo`, and import both rigs into Blender using explicit object references (`ROOT_A` / `ROOT_B`, `ARM_A` / `ARM_B` — never `next(o for o in bpy.data.objects ...)` in a duo scene).
+- **Two-Person Duo Scenes (`compile_duo_motion_intent`)**:
+  - Use **`popo-mmd.compile_duo_motion_intent`** (`DuoMotionIntent`) for synchronized two-person scenes instead of compiling A & B blindly.
+  - Supports dynamic `"partner:head" | "partner:hand_l/r" | "partner:shoulder_l/r" | "partner:cheek_l/r" | "partner:waist_l/r"` hand targets, declarative `contacts` (`hold_hands`, `high_five`, `pat_shoulder`, `hand_on_waist`), optional per-beat `placementA`/`placementB` movement, and cross-actor body/cloth collision avoidance.
+  - **`gaze` is strictly opt-in and independent**: actors do NOT force eye contact by default (ideal for side-by-side camera poses or asymmetric focus). Set `gaze.target` to `"partner:head"` / `"partner:hand_l/r"` or `[x, y, z]` only when attention is desired.
+  - Import both rigs into Blender using `blenderScene` from the response with explicit object references (`ROOT_A` / `ROOT_B`, `ARM_A` / `ARM_B` — never `next(o for o in bpy.data.objects ...)` in a duo scene).

@@ -52,7 +52,13 @@ export interface DuoActorPrepared {
 }
 
 export interface DuoIssue {
-  code: "torso_clipping" | "head_clipping" | "hand_inside_partner"
+  code:
+    | "torso_clipping"
+    | "head_clipping"
+    | "hand_inside_partner"
+    | "arm_clipping"
+    | "leg_clipping"
+    | "fingertip_inside_partner"
   frame: number
   timeSec: number
   distUnits: number
@@ -183,6 +189,45 @@ function distPointToSeg(p: Vec3, a: Vec3, b: Vec3): number {
   return Math.hypot(p.x - (a.x + abx * t), p.y - (a.y + aby * t), p.z - (a.z + abz * t))
 }
 
+function distSegToSeg(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3): number {
+  const ux = a1.x - a0.x, uy = a1.y - a0.y, uz = a1.z - a0.z
+  const vx = b1.x - b0.x, vy = b1.y - b0.y, vz = b1.z - b0.z
+  const wx = a0.x - b0.x, wy = a0.y - b0.y, wz = a0.z - b0.z
+  const a = ux * ux + uy * uy + uz * uz
+  const b = ux * vx + uy * vy + uz * vz
+  const c = vx * vx + vy * vy + vz * vz
+  const d = ux * wx + uy * wy + uz * wz
+  const e = vx * wx + vy * wy + vz * wz
+  const D = a * c - b * b
+  let sN: number, sD = D
+  let tN: number, tD = D
+  if (D < 1e-6) {
+    sN = 0; sD = 1; tN = e; tD = c
+  } else {
+    sN = b * e - c * d
+    tN = a * e - b * d
+    if (sN < 0) { sN = 0; tN = e; tD = c }
+    else if (sN > sD) { sN = sD; tN = e + b; tD = c }
+  }
+  if (tN < 0) {
+    tN = 0
+    if (-d < 0) sN = 0
+    else if (-d > a) sN = sD
+    else { sN = -d; sD = a }
+  } else if (tN > tD) {
+    tN = tD
+    if (-d + b < 0) sN = 0
+    else if (-d + b > a) sN = sD
+    else { sN = -d + b; sD = a }
+  }
+  const sc = Math.abs(sN) < 1e-6 ? 0 : sN / sD
+  const tc = Math.abs(tN) < 1e-6 ? 0 : tN / tD
+  const dx = wx + sc * ux - tc * vx
+  const dy = wy + sc * uy - tc * vy
+  const dz = wz + sc * uz - tc * vz
+  return Math.hypot(dx, dy, dz)
+}
+
 function headCenterWorld(actor: DuoActorPrepared, tf: FrameTransforms): Vec3 | null {
   const p = posOf(actor.bones, tf, "頭")
   const q = quatOf(actor.bones, tf, "頭")
@@ -282,7 +327,7 @@ export function analyzeDuoFrame(
     if (!wrist) return
     if (partnerHead) {
       const dh = Math.hypot(wrist.x - partnerHead.x, wrist.y - partnerHead.y, wrist.z - partnerHead.z)
-      if (dh < partnerHeadR * 0.65) {
+      if (dh < partnerHeadR * 0.50) {
         issues.push({
           code: "hand_inside_partner",
           frame,
@@ -310,6 +355,112 @@ export function analyzeDuoFrame(
   checkHandInside("A", "hand_r", wAR, "B", hB, actorB.headRadius, loB, upB, actorB.torsoRadius)
   checkHandInside("B", "hand_l", wBL, "A", hA, actorA.headRadius, loA, upA, actorA.torsoRadius)
   checkHandInside("B", "hand_r", wBR, "A", hA, actorA.headRadius, loA, upA, actorA.torsoRadius)
+
+  // Fingertip penetration check against partner head/torso
+  const TIP_NAMES = ["親指２", "人指３", "中指３", "薬指３", "小指３"] as const
+  const checkFingertips = (
+    owner: DuoActorPrepared,
+    tfOwner: FrameTransforms,
+    ownerLabel: string,
+    partnerLabel: string,
+    partnerHead: Vec3 | null,
+    partnerHeadR: number,
+    partnerLo: Vec3 | null,
+    partnerUp: Vec3 | null,
+    partnerTorsoR: number,
+  ) => {
+    for (const side of ["左", "右"] as const) {
+      let worstDist = Infinity
+      let worstWhere = ""
+      for (const tip of TIP_NAMES) {
+        const pt = posOf(owner.bones, tfOwner, `${side}${tip}`)
+        if (!pt) continue
+        if (partnerHead) {
+          const dh = Math.hypot(pt.x - partnerHead.x, pt.y - partnerHead.y, pt.z - partnerHead.z)
+          if (dh < partnerHeadR * 0.48 && dh < worstDist) {
+            worstDist = dh
+            worstWhere = "head"
+          }
+        }
+        if (partnerLo && partnerUp) {
+          const dt = distPointToSeg(pt, partnerLo, partnerUp)
+          if (dt < partnerTorsoR * 0.52 && dt < worstDist) {
+            worstDist = dt
+            worstWhere = "torso"
+          }
+        }
+      }
+      if (worstWhere) {
+        issues.push({
+          code: "fingertip_inside_partner",
+          frame,
+          timeSec,
+          distUnits: r2(worstDist),
+          message: `t=${timeSec}s: ${ownerLabel}.${side === "左" ? "hand_l" : "hand_r"} fingertips clip inside ${partnerLabel} ${worstWhere} (dist=${r2(worstDist)}u)`,
+        })
+      }
+    }
+  }
+  checkFingertips(actorA, tfA, "A", "B", hB, actorB.headRadius, loB, upB, actorB.torsoRadius)
+  checkFingertips(actorB, tfB, "B", "A", hA, actorA.headRadius, loA, upA, actorA.torsoRadius)
+
+  // Cross-actor arm-to-arm & leg-to-leg segment collision checks
+  const segsOf = (actor: DuoActorPrepared, tf: FrameTransforms, pairs: Array<[string, string, string]>) => {
+    const out: Array<{ label: string; a: Vec3; b: Vec3 }> = []
+    for (const [label, j0, j1] of pairs) {
+      const a = posOf(actor.bones, tf, j0)
+      const b = posOf(actor.bones, tf, j1)
+      if (a && b) out.push({ label, a, b })
+    }
+    return out
+  }
+  const armsA = segsOf(actorA, tfA, [
+    ["upper_l", "左腕", "左ひじ"], ["fore_l", "左ひじ", "左手首"],
+    ["upper_r", "右腕", "右ひじ"], ["fore_r", "右ひじ", "右手首"],
+  ])
+  const armsB = segsOf(actorB, tfB, [
+    ["upper_l", "左腕", "左ひじ"], ["fore_l", "左ひじ", "左手首"],
+    ["upper_r", "右腕", "右ひじ"], ["fore_r", "右ひじ", "右手首"],
+  ])
+  for (const sa of armsA) {
+    for (const sb of armsB) {
+      const d = distSegToSeg(sa.a, sa.b, sb.a, sb.b)
+      if (d < 0.32) {
+        issues.push({
+          code: "arm_clipping",
+          frame,
+          timeSec,
+          distUnits: r2(d),
+          message: `t=${timeSec}s: A.${sa.label} clips with B.${sb.label} (dist=${r2(d)}u)`,
+        })
+      }
+    }
+  }
+
+  const legsA = segsOf(actorA, tfA, [
+    ["thigh_l", "左足", "左ひざ"], ["shin_l", "左ひざ", "左足首"],
+    ["thigh_r", "右足", "右ひざ"], ["shin_r", "右ひざ", "右足首"],
+  ])
+  const legsB = segsOf(actorB, tfB, [
+    ["thigh_l", "左足", "左ひざ"], ["shin_l", "左ひざ", "左足首"],
+    ["thigh_r", "右足", "右ひざ"], ["shin_r", "右ひざ", "右足首"],
+  ])
+  for (const sa of legsA) {
+    for (const sb of legsB) {
+      const isBothThigh = sa.label.startsWith("thigh") && sb.label.startsWith("thigh")
+      const minD = isBothThigh ? 1.02 : 0.68
+      const d = distSegToSeg(sa.a, sa.b, sb.a, sb.b)
+      if (d < minD) {
+        issues.push({
+          code: "leg_clipping",
+          frame,
+          timeSec,
+          distUnits: r2(d),
+          message: `t=${timeSec}s: A.${sa.label} clips with B.${sb.label} (dist=${r2(d)}u < ${minD}u)`,
+        })
+      }
+    }
+  }
 
   return {
     frame,
@@ -348,25 +499,42 @@ export function analyzeDuoSequence(
   const durationSec = r2(maxFrame / 30)
 
   let frameList: number[]
-  if (Array.isArray(sampleTimes) && sampleTimes.length > 0) {
+  const explicitSamples = Array.isArray(sampleTimes) && sampleTimes.length > 0
+  if (explicitSamples) {
     frameList = [...new Set(sampleTimes.map((t) => Math.max(0, Math.min(maxFrame, Math.round(t * 30)))))].sort((a, b) => a - b)
   } else {
-    const count = Math.min(8, Math.max(2, Math.ceil(maxFrame / 15) + 1))
     frameList = []
-    for (let i = 0; i < count; i++) {
-      frameList.push(Math.round((i * maxFrame) / Math.max(1, count - 1)))
-    }
-    frameList = [...new Set(frameList)]
+    for (let f = 0; f <= maxFrame; f += 2) frameList.push(f)
+    if (frameList[frameList.length - 1] !== maxFrame) frameList.push(maxFrame)
   }
 
-  const frames: DuoFrameMetrics[] = []
+  const allFrames: DuoFrameMetrics[] = []
   const allIssues: DuoIssue[] = []
   for (const f of frameList) {
     const m = analyzeDuoFrame(actorA, actorB, f)
     if (m) {
-      frames.push(m)
+      allFrames.push(m)
       allIssues.push(...m.issues)
     }
+  }
+
+  // Keep report compact on dense scans: up to 12 evenly spaced frames + up to 4 worst-issue frames (issues per frame capped at 8)
+  let frames = allFrames
+  if (!explicitSamples && allFrames.length > 16) {
+    const kept = new Set<number>()
+    for (let i = 0; i < 12; i++) kept.add(Math.round((i * (allFrames.length - 1)) / 11))
+    const issueIndices = allFrames
+      .map((m, idx) => ({ idx, cnt: m.issues.length }))
+      .filter((x) => x.cnt > 0)
+      .sort((a, b) => b.cnt - a.cnt)
+      .slice(0, 4)
+    for (const x of issueIndices) kept.add(x.idx)
+    frames = [...kept]
+      .sort((a, b) => a - b)
+      .map((idx) => {
+        const m = allFrames[idx]
+        return m.issues.length > 8 ? { ...m, issues: m.issues.slice(0, 8) } : m
+      })
   }
 
   return {

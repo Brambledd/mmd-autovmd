@@ -79,12 +79,13 @@ try {
     "execute_blender_code",
     "compile_motion_intent",
     "get_blender_viewport",
+    "compile_duo_motion_intent",
   ])
   for (const t of listed.tools) {
     assert(t.description && t.description.length > 20, `${t.name} needs a description`)
     assert.equal(t.inputSchema.type, "object", `${t.name} schema must be an object`)
   }
-  console.log("  ok  tools/list (13 tools, make_motion first)")
+  console.log("  ok  tools/list (14 tools, make_motion first)")
 
   const modelsRes = await rpc("tools/call", { name: "list_models", arguments: {} })
   const models = JSON.parse(modelsRes.content[0].text)

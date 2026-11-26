@@ -361,7 +361,7 @@ function pushOutOfCapsule(p: V3, a: V3, b: V3, radiusA: number, radiusB = radius
   return vAdd(closest, vScale(n, radius))
 }
 
-interface WorldHull {
+export interface WorldHull {
   id: string
   bonePos: V3
   boneRot: Quat
@@ -507,7 +507,7 @@ function applyHandGripToFrame(
 
 // ------------------------------------------------------------------ Mini Grant-Aware FK
 
-interface FkState {
+export interface FkState {
   pos: Map<number, V3>
   rot: Map<number, Quat>
 }
@@ -615,10 +615,43 @@ function decimateTrack(samples: RawBoneSample[], angleTolDeg = 0.25, posTol = 0.
 
 // ------------------------------------------------------------------ Main Solver
 
+export interface SolveMotionIntentOptions {
+  /** Inject partner body hulls (in this actor's local space) for arm & cloth/hair collision avoidance */
+  externalWorldHulls?: (frame: number, timeSec: number) => WorldHull[]
+  /** Override hand target in this actor's local space (for dynamic partner:* targets & mutual contacts) */
+  overrideHandTarget?: (
+    frame: number,
+    side: "l" | "r",
+    timeSec: number,
+  ) => {
+    localTarget: V3
+    localNormal?: V3
+    palmMode?: string
+    endEffector?: "wrist" | "palm" | "fingertip"
+    grip?: string
+  } | null
+  /** Optional dynamic gaze override (in degrees, actor-local). Return null to keep normal single-actor gaze. */
+  overrideGaze?: (
+    frame: number,
+    headLocalPos: V3,
+    timeSec: number,
+  ) => { headYawDeg?: number; headPitchDeg?: number } | null
+  /** Optional dynamic root placement (全ての親) offset/yaw relative to initial placement */
+  rootLocalTransform?: (
+    frame: number,
+    timeSec: number,
+  ) => { pos: V3; yawDeg: number } | null
+  /** Beat timestamps (sec) where Lead & Follow phase lag should taper to 0 for tight duo sync */
+  syncContactTimes?: number[]
+  /** Callback fired after each frame is solved (gives exact local FK & hulls) */
+  onFrameSolved?: (frame: number, fk: FkState, worldHulls: WorldHull[]) => void
+}
+
 export function solveMotionIntent(
   intent: MotionIntent,
   profile: RigProfile,
   bones: PmxBones,
+  options?: SolveMotionIntentOptions,
 ): RigSolveResult {
   const tStart = performance.now()
   const fps = intent.fps ?? 30
@@ -659,9 +692,15 @@ export function solveMotionIntent(
     return { prev: last, a: last, b: last, next: last, rawT: 1, t: 1, span: 1, effort: last.effort ?? "soft" as EffortStyle, passThrough: false }
   }
 
-  // Upgrade C: Body-Part Lead & Follow phase-shifted time (smoothly tapered to 0 at clip start & end!)
-  const phaseTime = (timeSec: number, leadSec: number) => {
-    const edge = Math.min(1, timeSec / 0.25, (durationSec - timeSec) / 0.25)
+  // Upgrade C: Body-Part Lead & Follow phase-shifted time (smoothly tapered to 0 at clip start, end & duo contact beats for arms/hands!)
+  const phaseTime = (timeSec: number, leadSec: number, isContactSynced = false) => {
+    let edge = Math.min(1, timeSec / 0.25, (durationSec - timeSec) / 0.25)
+    if (isContactSynced && options?.syncContactTimes && options.syncContactTimes.length > 0) {
+      for (const ct of options.syncContactTimes) {
+        const d = Math.abs(timeSec - ct)
+        if (d < 0.35) edge = Math.min(edge, d / 0.35)
+      }
+    }
     return Math.max(0, Math.min(durationSec, timeSec + leadSec * Math.max(0, edge)))
   }
 
@@ -770,8 +809,8 @@ export function solveMotionIntent(
     const sHead = sampleBeats(phaseTime(timeSec, +0.06))
     const sStance = sampleBeats(phaseTime(timeSec, +0.04))
     const sSpine = sampleBeats(timeSec)
-    const sArm = sampleBeats(phaseTime(timeSec, -0.05))
-    const sHand = sampleBeats(phaseTime(timeSec, -0.09))
+    const sArm = sampleBeats(phaseTime(timeSec, -0.05, true))
+    const sHand = sampleBeats(phaseTime(timeSec, -0.09, true))
 
     const sp = EFFORT_SPRING[sSpine.effort]
 
@@ -808,6 +847,14 @@ export function solveMotionIntent(
     const localTrans = new Map<string, V3>()
     for (const [jp, q] of Object.entries(profile.neutralPose)) {
       localRots.set(jp, q)
+    }
+
+    // Optional dynamic root placement (全ての親) for duo walking/approach
+    const rootDyn = options?.rootLocalTransform?.(frame, timeSec)
+    const qRootDyn = rootDyn ? qFromAxisAngle([0, 1, 0], -rootDyn.yawDeg) : IDENTITY
+    if (rootDyn && bones.indexByJp.has("全ての親")) {
+      localTrans.set("全ての親", rootDyn.pos)
+      localRots.set("全ての親", qRootDyn)
     }
 
     // ---- Layer 1: Pelvis / Center + Elastic Groove + Exact 2-Bone Leg IK (Source-level Grounding) ----
@@ -863,8 +910,12 @@ export function solveMotionIntent(
       const hipParentRot = hipParentIdx >= 0 ? (fk.rot.get(hipParentIdx) ?? IDENTITY) : IDENTITY
 
       const soleBiasY = Math.abs(leg.restFootMinY) <= 0.25 ? -leg.restFootMinY : 0
-      const targetAnkle: V3 = [leg.restAnklePos[0], leg.restAnklePos[1] + soleBiasY, leg.restAnklePos[2]]
-      const kneePole: V3 = [side === "l" ? 0.12 : -0.12, 0, -1]
+      const baseAnkle: V3 = [leg.restAnklePos[0], leg.restAnklePos[1] + soleBiasY, leg.restAnklePos[2]]
+      const targetAnkle: V3 = rootDyn
+        ? vAdd(qRotate(qRootDyn, baseAnkle), rootDyn.pos)
+        : baseAnkle
+      const basePole: V3 = [side === "l" ? 0.12 : -0.12, 0, -1]
+      const kneePole: V3 = rootDyn ? qRotate(qRootDyn, basePole) : basePole
       const { K, endPos } = solveTwoBoneMid(hipPos, targetAnkle, leg.thighLen, leg.shinLen, kneePole)
 
       const restHip = restWorld.get(hipIdx)!
@@ -876,7 +927,10 @@ export function solveMotionIntent(
       const curThighDir = vNorm(vSub(K, hipPos))
       const curShinDir = vNorm(vSub(endPos, K))
 
-      const qThighWorld = qFromTwoVectors(restThighDir, curThighDir)
+      const restThighAfterRoot = rootDyn ? qRotate(qRootDyn, restThighDir) : restThighDir
+      const qThighWorld = rootDyn
+        ? qMul(qFromTwoVectors(restThighAfterRoot, curThighDir), qRootDyn)
+        : qFromTwoVectors(restThighDir, curThighDir)
       const qHipLocal = qMul(qConj(hipParentRot), qThighWorld)
       localRots.set(leg.hipJp, qHipLocal)
 
@@ -886,9 +940,9 @@ export function solveMotionIntent(
       const qKneeLocal = qMul(qConj(qThighWorld), qMul(qKneeDelta, qThighWorld))
       localRots.set(leg.kneeJp, qKneeLocal)
 
-      // Keep ankle flat in world space (exact sole grounding!)
+      // Keep ankle flat in world space (exact sole grounding, aligned to rootDyn!)
       const qShinWorld = qMul(qThighWorld, qKneeLocal)
-      localRots.set(leg.ankleJp, qConj(qShinWorld))
+      localRots.set(leg.ankleJp, rootDyn ? qMul(qConj(qShinWorld), qRootDyn) : qConj(qShinWorld))
     }
 
     // ---- Layer 3: Gaze (Head + Eyes) — leads torso (Upgrade C) and runs BEFORE Hands so face anchors stay exact! ----
@@ -904,8 +958,17 @@ export function solveMotionIntent(
         if (gt === "down") return 16
         return 0
       }
-      const headYawTarget = gazeYawOf(sHead.a.gaze?.target) + (gazeYawOf(sHead.b.gaze?.target) - gazeYawOf(sHead.a.gaze?.target)) * sHead.t
-      const headPitchBias = gazePitchBiasOf(sHead.a.gaze?.target) + (gazePitchBiasOf(sHead.b.gaze?.target) - gazePitchBiasOf(sHead.a.gaze?.target)) * sHead.t
+      let headYawTarget = gazeYawOf(sHead.a.gaze?.target) + (gazeYawOf(sHead.b.gaze?.target) - gazeYawOf(sHead.a.gaze?.target)) * sHead.t
+      let headPitchBias = gazePitchBiasOf(sHead.a.gaze?.target) + (gazePitchBiasOf(sHead.b.gaze?.target) - gazePitchBiasOf(sHead.a.gaze?.target)) * sHead.t
+      if (options?.overrideGaze) {
+        const headIdx = bones.indexByJp.get("頭")
+        const headLocalPos = headIdx != null ? (fk.pos.get(headIdx) ?? [0, 16, 0] as V3) : ([0, 16, 0] as V3)
+        const ov = options.overrideGaze(frame, headLocalPos, timeSec)
+        if (ov) {
+          if (ov.headYawDeg != null) headYawTarget = Math.max(-65, Math.min(65, ov.headYawDeg))
+          if (ov.headPitchDeg != null) headPitchBias = Math.max(-35, Math.min(35, ov.headPitchDeg))
+        }
+      }
       const headYawDyn = sprHeadYaw.step(dt, headYawTarget, sp.f * 0.9, sp.z * 0.9, sp.r)
 
       const qHead = qMul(
@@ -942,6 +1005,8 @@ export function solveMotionIntent(
         slices: cap.slices,
       }
     }).filter((c): c is NonNullable<typeof c> => c !== null)
+    const extHulls = options?.externalWorldHulls?.(frame, timeSec) ?? []
+    for (const eh of extHulls) worldHulls.push(eh)
 
     const FACE_ANCHORS = new Set(["cheek_l", "cheek_r", "mouth", "chin", "forehead"])
     const WAIST_ANCHORS = new Set(["waist_side_l", "waist_side_r", "hip_side_l", "hip_side_r"])
@@ -983,6 +1048,31 @@ export function solveMotionIntent(
       const arm = profile.arms[side]
       const palmLen = arm.palmLen ?? 0.85
       const sSign = side === "l" ? 1 : -1
+
+      const dynOv = options?.overrideHandTarget?.(frame, side, timeSec)
+      if (dynOv) {
+        const worldNormal: V3 = dynOv.localNormal ? vNorm(dynOv.localNormal) : [0, 0, -1]
+        const palmMode = dynOv.palmMode ?? intentHand?.palm ?? "surface"
+        const eff = dynOv.endEffector ?? intentHand?.endEffector ?? "palm"
+        let basePos = dynOv.localTarget
+        const surfacePos = dynOv.localTarget
+        if (eff !== "wrist") {
+          const { fingerDir } = computeHandFrameHint(palmMode, worldNormal, "partner", sSign)
+          const lEff = eff === "fingertip" ? palmLen * 0.92 : palmLen * 0.50
+          const dPalm = 0.14
+          basePos = vSub(vAdd(surfacePos, vScale(worldNormal, dPalm)), vScale(fingerDir, lEff))
+        }
+        return {
+          active: true,
+          pos: basePos,
+          surfacePos,
+          normal: worldNormal,
+          arc: intentHand?.arc ?? "natural",
+          targetName: "partner",
+          palmMode,
+        }
+      }
+
       if (!intentHand || intentHand.mode === "rest" || !intentHand.target) {
         const wIdx = bones.indexByJp.get(side === "l" ? "左手首" : "右手首")
         const wp = wIdx != null ? fk.pos.get(wIdx)! : [0, 12, 0] as V3
@@ -994,8 +1084,9 @@ export function solveMotionIntent(
       let targetName = ""
       let palmMode = intentHand.palm ?? "natural"
       if (Array.isArray(intentHand.target)) {
-        basePos = intentHand.target
-        surfacePos = intentHand.target
+        const tgt = rootDyn ? vAdd(qRotate(qRootDyn, intentHand.target), rootDyn.pos) : intentHand.target
+        basePos = tgt
+        surfacePos = tgt
       } else {
         targetName = intentHand.target
         const anc = profile.anchors[intentHand.target]
@@ -1479,6 +1570,7 @@ export function solveMotionIntent(
           slices: cap.slices,
         }
       }).filter((c): c is NonNullable<typeof c> => c !== null)
+      for (const eh of extHulls) physHulls.push(eh)
 
       for (let ni = 0; ni < physNodes.length; ni++) {
         const node = physNodes[ni]
@@ -1555,8 +1647,9 @@ export function solveMotionIntent(
 
         // Elliptical Body Hull Collision Push-out (keeps hair/ribbons outside head/chest/torso/thighs!)
         for (const hull of physHulls) {
-          if (isHair && hull.id !== "head" && hull.id !== "chest") continue
-          if (!isHair && hull.id === "head") continue
+          const isPartner = hull.id.startsWith("partner_")
+          if (isHair && !isPartner && hull.id !== "head" && hull.id !== "chest") continue
+          if (!isHair && !isPartner && hull.id === "head") continue
           const margin = (isHair && hull.id === "head") ? 0.01 : 0.03
           const pushed = pushOutOfHull(candTip, hull, margin)
           if (vLen(vSub(pushed, candTip)) > 1e-4) {
@@ -1584,6 +1677,11 @@ export function solveMotionIntent(
     }
     for (const [jp, tr] of localTrans.entries()) {
       if (!localRots.has(jp)) recordBone(jp, frame, tr, IDENTITY)
+    }
+
+    if (options?.onFrameSolved) {
+      const fkFinal = solveFkSnapshot(bones, restWorld, localRots, localTrans)
+      options.onFrameSolved(frame, fkFinal, worldHulls)
     }
   }
 

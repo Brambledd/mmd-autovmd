@@ -45,6 +45,7 @@ import { auditVmd } from "../lib/pose-audit.ts"
 import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
 import { buildRigProfile, RIG_PROFILE_VERSION } from "../lib/rig-profile.ts"
 import { solveMotionIntent, type MotionIntent } from "../lib/rig-solver.ts"
+import { solveDuoMotionIntent, type DuoMotionIntent } from "../lib/duo-solver.ts"
 import { renderPoseMultiViewPng, renderStoryboardPng, renderDuoMultiViewPng, renderDuoStoryboardPng } from "../lib/pose-renderer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
 import { measureGroundErrorVmd, summarizeGroundMeasure, type GroundMeasure } from "../lib/ground-bake.ts"
@@ -896,6 +897,26 @@ const TOOLS = [
         host: { type: "string", description: "Blender MCP socket host (default: BLENDER_HOST or 127.0.0.1)" },
         port: { type: "number", description: "Blender MCP socket port (default: BLENDER_PORT or 9876)" },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "compile_duo_motion_intent",
+    description:
+      "Joint two-person (duo) MotionIntent compiler: solves Actor A and Actor B collaboratively on a synchronized 30fps timeline with dynamic partner:* hand targets, declarative contacts (hold_hands / high_five / pat_shoulder / hand_on_waist), optional opt-in gaze tracking, cross-actor body & cloth collision avoidance, and optional per-beat root movement. Outputs actorA.vmd, actorB.vmd, dense duo collision report, and Blender duo scene placement.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intent: {
+          type: "object",
+          description: "DuoMotionIntent JSON: { title?, fps?, breathing?, autoBlink?, secondaryPhysics?, leadActor?: 'A'|'B', actors: { A: { modelId?, pmxPath?, placement: { offset, yawDeg } }, B: { ... } }, beats: [{ at, effort?, passThrough?, A?, B?, placementA?, placementB?, contacts? }] }",
+        },
+        outDir: { type: "string", description: "Output directory for actorA.vmd & actorB.vmd (default: .tmp/duo/<timestamp>)" },
+        rebuildProfile: { type: "boolean", description: "Force rebuild of <model>.rig-profile.json (default: false)" },
+        renderViews: { type: "boolean", description: "Render duo storyboard/multi-view PNG (default: true)" },
+        maxTiles: { type: "number", description: "Max storyboard tiles when renderViews=true (default: 6)" },
+      },
+      required: ["intent"],
       additionalProperties: false,
     },
   },
@@ -1762,7 +1783,8 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         source: actB.sourceDesc,
       },
       convertedLocalPoint,
-      issues: analysis.allIssues,
+      issueCount: analysis.allIssues.length,
+      issues: analysis.allIssues.slice(0, 60),
       frames: analysis.frames,
       render: renderInfo,
     }
@@ -1812,27 +1834,27 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     }
   }
 
+function loadOrBuildRigProfile(entry: ResolvedModelEntry, bones: PmxBones, rebuild = false) {
+  const pmxAbs = entry.pmxPath ?? path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
+  const profilePath = path.join(path.dirname(pmxAbs), `${entry.id}.rig-profile.json`)
+  if (!rebuild && fs.existsSync(profilePath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(profilePath, "utf8"))
+      if (parsed?.version === RIG_PROFILE_VERSION) return { profile: parsed, profilePath, pmxAbs }
+    } catch { /* rebuild */ }
+  }
+  const built = buildRigProfile(bones, entry.id)
+  try { fs.writeFileSync(profilePath, JSON.stringify(built, null, 2)) } catch { /* ignore read-only */ }
+  return { profile: built, profilePath, pmxAbs }
+}
+
   if (name === "compile_motion_intent") {
     const { entry, bones } = loadModelFromArgs(args)
     const intent = args.intent as MotionIntent
     if (!intent || !Array.isArray(intent.beats) || intent.beats.length === 0) {
       throw new Error("intent.beats must be a non-empty array")
     }
-    const pmxAbs = entry.pmxPath ?? path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
-    const profilePath = path.join(path.dirname(pmxAbs), `${entry.id}.rig-profile.json`)
-    const rebuild = args.rebuildProfile === true
-    let cachedProfile: ReturnType<typeof buildRigProfile> | null = null
-    if (!rebuild && fs.existsSync(profilePath)) {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(profilePath, "utf8"))
-        if (parsed?.version === RIG_PROFILE_VERSION) cachedProfile = parsed
-      } catch { /* rebuild */ }
-    }
-    const profile = cachedProfile ?? (() => {
-      const built = buildRigProfile(bones, entry.id)
-      try { fs.writeFileSync(profilePath, JSON.stringify(built, null, 2)) } catch { /* ignore read-only */ }
-      return built
-    })()
+    const { profile, profilePath } = loadOrBuildRigProfile(entry, bones, args.rebuildProfile === true)
 
     const solved = solveMotionIntent(intent, profile, bones)
     const outRel = typeof args.outVmdPath === "string" && args.outVmdPath.trim()
@@ -1873,6 +1895,118 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
         },
       ],
     }
+  }
+
+  if (name === "compile_duo_motion_intent") {
+    const intent = args.intent as DuoMotionIntent
+    if (!intent || !Array.isArray(intent.beats) || intent.beats.length === 0) {
+      throw new Error("intent.beats must be a non-empty array")
+    }
+    if (!intent.actors?.A || !intent.actors?.B) {
+      throw new Error("intent.actors.A and intent.actors.B are required")
+    }
+    const rebuild = args.rebuildProfile === true
+    const loadSide = (sideSpec: DuoMotionIntent["actors"]["A"], defaultId: string) => {
+      const { entry, bones } = loadModelSync(sideSpec.modelId ?? defaultId, sideSpec.pmxPath)
+      const { profile, profilePath, pmxAbs } = loadOrBuildRigProfile(entry, bones, rebuild)
+      return {
+        entry,
+        bones,
+        profile,
+        profilePath,
+        pmxAbs,
+        placement: sideSpec.placement ?? { offset: [defaultId === "topaz" ? -4 : 4, 0, 0], yawDeg: 0 },
+      }
+    }
+    const sideA = loadSide(intent.actors.A, "topaz")
+    const sideB = loadSide(intent.actors.B, "caelus")
+
+    const solved = solveDuoMotionIntent(
+      intent,
+      { bones: sideA.bones, profile: sideA.profile, placement: sideA.placement },
+      { bones: sideB.bones, profile: sideB.profile, placement: sideB.placement },
+    )
+
+    const outDirRel = typeof args.outDir === "string" && args.outDir.trim()
+      ? args.outDir.trim()
+      : `.tmp/duo/${Date.now().toString(36)}`
+    const outDirAbs = path.resolve(ROOT_DIR, outDirRel)
+    fs.mkdirSync(outDirAbs, { recursive: true })
+    const vmdPathA = path.join(outDirAbs, "actorA.vmd")
+    const vmdPathB = path.join(outDirAbs, "actorB.vmd")
+    fs.writeFileSync(vmdPathA, solved.actorA.vmd)
+    fs.writeFileSync(vmdPathB, solved.actorB.vmd)
+
+    const criticA = critiquePoseVmd(sideA.bones, solved.actorA.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
+    const criticB = critiquePoseVmd(sideB.bones, solved.actorB.vmd, "", [{ index: 0, start: 0, end: solved.durationSec }])
+    const groundA = groundSummaryOf(sideA.bones, solved.actorA.vmd)
+    const groundB = groundSummaryOf(sideB.bones, solved.actorB.vmd)
+
+    const prepA = prepareDuoActor({ label: "A", bones: sideA.bones, vmd: solved.actorA.vmd, placement: sideA.placement }, "A")
+    const prepB = prepareDuoActor({ label: "B", bones: sideB.bones, vmd: solved.actorB.vmd, placement: sideB.placement }, "B")
+    const duoAnalysis = prepA && prepB ? analyzeDuoSequence(prepA, prepB) : null
+
+    const ok = Boolean(
+      criticA?.passed &&
+      criticB?.passed &&
+      (!groundA || groundA.offendingFrames === 0) &&
+      (!groundB || groundB.offendingFrames === 0) &&
+      duoAnalysis?.passed,
+    )
+
+    const blA = toBlenderRootPlacement(sideA.placement)
+    const blB = toBlenderRootPlacement(sideB.placement)
+    const content: Array<Record<string, unknown>> = []
+    if (args.renderViews !== false) {
+      const renderA = { bones: sideA.bones, vmd: solved.actorA.vmd, placement: sideA.placement, tag: "A" }
+      const renderB = { bones: sideB.bones, vmd: solved.actorB.vmd, placement: sideB.placement, tag: "B" }
+      if (solved.durationSec < 1.5) {
+        const png = renderDuoMultiViewPng(renderA, renderB)
+        if (png) content.push({ type: "image", data: png.dataUrl.replace(/^data:image\/png;base64,/, ""), mimeType: "image/png" })
+      } else {
+        const maxTiles = typeof args.maxTiles === "number" && Number.isFinite(args.maxTiles) ? args.maxTiles : 6
+        const sb = renderDuoStoryboardPng(renderA, renderB, { maxTiles })
+        if (sb) content.push({ type: "image", data: sb.dataUrl.replace(/^data:image\/png;base64,/, ""), mimeType: "image/png" })
+      }
+    }
+
+    content.push({
+      type: "text",
+      text: stringifyReport({
+        ok,
+        durationSec: solved.durationSec,
+        frameCount: solved.frameCount,
+        syncContactTimes: solved.syncContactTimes,
+        solveTimeMs: solved.solveTimeMs,
+        actorA: {
+          modelId: sideA.entry.id,
+          vmdPath: vmdPathA,
+          vmdBytes: solved.actorA.vmd.byteLength,
+          critic: criticA,
+          groundContact: groundA,
+        },
+        actorB: {
+          modelId: sideB.entry.id,
+          vmdPath: vmdPathB,
+          vmdBytes: solved.actorB.vmd.byteLength,
+          critic: criticB,
+          groundContact: groundB,
+        },
+        duoAnalysis: duoAnalysis
+          ? {
+              passed: duoAnalysis.passed,
+              issueCount: duoAnalysis.allIssues.length,
+              issues: duoAnalysis.allIssues.slice(0, 60),
+              frames: duoAnalysis.frames,
+            }
+          : null,
+        blenderScene: {
+          actorA: { pmxPath: sideA.pmxAbs, vmdPath: vmdPathA, blenderRoot: blA },
+          actorB: { pmxPath: sideB.pmxAbs, vmdPath: vmdPathB, blenderRoot: blB },
+        },
+      }),
+    })
+    return { content }
   }
 
   if (name === "get_blender_viewport") {

@@ -195,6 +195,46 @@ try {
   assert.equal(repCaelus.verdict.groundContact.offendingFrames, 0, "caelus squat must have 0 offending ground frames")
   pass(`caelus squat ground-bake (0 offending, worst=${repCaelus.verdict.groundContact.worst}u)`)
 
+  // Verify compile_duo_motion_intent (non-eye-contact side-by-side + dynamic partner:shoulder_r tracking)
+  const stepCompileDuo = await rpc("tools/call", {
+    name: "compile_duo_motion_intent",
+    arguments: {
+      renderViews: false,
+      intent: {
+        title: "Side-by-side duo test",
+        actors: {
+          A: { modelId: "topaz", placement: { offset: [2.6, 0, 0], yawDeg: 0 } },
+          B: { modelId: "caelus", placement: { offset: [-2.6, 0, 0], yawDeg: 0 } },
+        },
+        beats: [
+          {
+            at: 0,
+            A: { gaze: { target: "camera" }, hand_r: { mode: "rest" } },
+            B: { gaze: { target: "camera" }, hand_l: { mode: "reach", target: "partner:shoulder_r", grip: "open" } },
+          },
+          {
+            at: 1.0,
+            A: { stance: { squat: 0.6 }, gaze: { target: "camera" }, hand_r: { mode: "reach", target: "wave_r", grip: "open" } },
+            B: { gaze: { target: "camera" }, hand_l: { mode: "reach", target: "partner:shoulder_r", grip: "open" } },
+          },
+          {
+            at: 2.0,
+            A: { stance: { squat: 0.0 }, gaze: { target: "camera" }, hand_r: { mode: "rest" } },
+            B: { gaze: { target: "camera" }, hand_l: { mode: "reach", target: "partner:shoulder_r", grip: "open" } },
+          },
+        ],
+      },
+    },
+  })
+  const repDuo = JSON.parse(stepCompileDuo.content.find((c) => c.type === "text").text)
+  assert.equal(repDuo.ok, true, `side-by-side duo ok should be true: ${JSON.stringify(repDuo.duoAnalysis?.issues)}`)
+  assert.equal(repDuo.actorA.critic.passed, true, `actorA critic failed: ${JSON.stringify(repDuo.actorA.critic)}`)
+  assert.equal(repDuo.actorB.critic.passed, true, `actorB critic failed: ${JSON.stringify(repDuo.actorB.critic)}`)
+  assert.equal(repDuo.actorA.groundContact.offendingFrames, 0)
+  assert.equal(repDuo.actorB.groundContact.offendingFrames, 0)
+  assert(repDuo.blenderScene?.actorA?.pmxPath && repDuo.blenderScene?.actorB?.vmdPath, "blenderScene must be populated")
+  pass(`compile_duo_motion_intent side-by-side (solve=${repDuo.solveTimeMs}ms, ok=${repDuo.ok})`)
+
   console.log(`\nALL ${okCount} DUO CHECKS PASSED`)
 } finally {
   child.kill()
