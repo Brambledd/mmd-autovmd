@@ -17,7 +17,7 @@
 import Encoding from "encoding-japanese"
 import { restWorldPositions } from "./model-geometry.ts"
 import type { EllipticalSlice, PmxBones } from "./pmx-bones.ts"
-import type { HandGripSpec, Quat, RigProfile, V3 } from "./rig-profile.ts"
+import type { ArmRig, HandGripSpec, Quat, RigProfile, V3 } from "./rig-profile.ts"
 import { serializeVmd, type BoneKey, type ParsedVmd, type PropertyFrame, type VmdCurve } from "./vmd-enhancer.ts"
 import { injectMorphFrames, type MorphKey } from "./vmd-morph.ts"
 
@@ -463,10 +463,11 @@ function applyHandGripToFrame(
   grip: HandGripSpec,
   bones: PmxBones,
   rotOut: Map<string, Quat>,
+  armRig?: ArmRig,
 ) {
   const p = side === "l" ? "左" : "右"
   const s = side === "l" ? 1 : -1
-  // In MMD A-pose, fingers extend along +/-X; curling fingers rotates around +/-Z (downward/inward toward palm)
+  // Use PMX-derived finger axes when available; fall back to standard MMD A-pose axes
   const fingerCurl: Array<[string, number, number]> = [
     ["人指", grip.indexCurl, 0.4],
     ["中指", grip.middleCurl, 0.0],
@@ -478,21 +479,27 @@ function applyHandGripToFrame(
     for (let k = 0; k < 3; k++) {
       const jp = `${p}${fName}${["１", "２", "３"][k]}`
       if (!bones.indexByJp.has(jp)) continue
-      let q = qFromAxisAngle([0, 0, 1], -s * segAngles[k])
+      const fa = armRig?.fingerAxes?.[jp]
+      const curlAxis: V3 = fa?.curlAxis ?? [0, 0, -s]
+      const spreadAxis: V3 = fa?.spreadAxis ?? [0, 1, 0]
+      let q = qFromAxisAngle(curlAxis, segAngles[k])
       if (k === 0 && Math.abs(spreadDir * grip.spread) > 0.01) {
-        q = qMul(q, qFromAxisAngle([0, 1, 0], s * spreadDir * grip.spread * 22))
+        q = qMul(q, qFromAxisAngle(spreadAxis, s * spreadDir * grip.spread * 22))
       }
       rotOut.set(jp, q)
     }
   }
-  // Thumb curls inward around Y and Z
+  // Thumb curls inward around anatomical spread+curl axes
   const thumbAngles = [grip.thumbCurl * 28, grip.thumbCurl * 38, grip.thumbCurl * 45]
   for (let k = 0; k < 3; k++) {
     const jp = `${p}親指${["０", "１", "２"][k]}`
     if (!bones.indexByJp.has(jp)) continue
+    const fa = armRig?.fingerAxes?.[jp]
+    const curlAxis: V3 = fa?.curlAxis ?? [0, 0, -s]
+    const spreadAxis: V3 = fa?.spreadAxis ?? [0, 1, 0]
     const q = qMul(
-      qFromAxisAngle([0, 1, 0], s * thumbAngles[k] * 0.7),
-      qFromAxisAngle([0, 0, 1], -s * thumbAngles[k] * 0.5),
+      qFromAxisAngle(spreadAxis, s * thumbAngles[k] * 0.7),
+      qFromAxisAngle(curlAxis, thumbAngles[k] * 0.5),
     )
     rotOut.set(jp, q)
   }
@@ -855,7 +862,8 @@ export function solveMotionIntent(
       const hipParentIdx = bones.bones[hipIdx].parent
       const hipParentRot = hipParentIdx >= 0 ? (fk.rot.get(hipParentIdx) ?? IDENTITY) : IDENTITY
 
-      const targetAnkle: V3 = [...leg.restAnklePos]
+      const soleBiasY = Math.abs(leg.restFootMinY) <= 0.25 ? -leg.restFootMinY : 0
+      const targetAnkle: V3 = [leg.restAnklePos[0], leg.restAnklePos[1] + soleBiasY, leg.restAnklePos[2]]
       const kneePole: V3 = [side === "l" ? 0.12 : -0.12, 0, -1]
       const { K, endPos } = solveTwoBoneMid(hipPos, targetAnkle, leg.thighLen, leg.shinLen, kneePole)
 
@@ -1185,7 +1193,7 @@ export function solveMotionIntent(
             const qHandBlended = qSlerp(qHandA, qHandB, smoothstep01(tArm))
             const qRel = qMul(qConj(qForeWorld), qHandBlended)
 
-            const { twist, swing } = decomposeTwistSwing(qRel, arm.restForeDir)
+            const { twist, swing } = decomposeTwistSwing(qRel, arm.wristTwistAxis ?? arm.restForeDir)
             const clampedTwist = qClampDeg(twist, rom.forearmTwistMaxDeg)
             const clampedSwing = qClampDeg(swing, rom.wristSwingMaxDeg)
             if (arm.wristTwistJp && bones.indexByJp.has(arm.wristTwistJp)) {
@@ -1214,7 +1222,7 @@ export function solveMotionIntent(
           // while parent arm keeps qSwing * qTwist55 -> preserves exact elbow/wrist world positions to 0.000mm!
           if (arm.armTwistJp && bones.indexByJp.has(arm.armTwistJp)) {
             const nq = qArmFull.w < 0 ? { x: -qArmFull.x, y: -qArmFull.y, z: -qArmFull.z, w: -qArmFull.w } : qNorm(qArmFull)
-            const ax = vNorm(arm.restUpperDir)
+            const ax = vNorm(arm.armTwistAxis ?? arm.restUpperDir)
             const proj = vDot([nq.x, nq.y, nq.z], ax)
             const qTwistAll = qNorm({ x: ax[0] * proj, y: ax[1] * proj, z: ax[2] * proj, w: nq.w })
             const qTwistChild = qClampDeg(qSlerp(IDENTITY, qTwistAll, 0.45), 55)
@@ -1266,7 +1274,7 @@ export function solveMotionIntent(
           return { maxPush, maxPushLen, tipPenLen }
         }
 
-        applyHandGripToFrame(side, gCur, bones, localRots)
+        applyHandGripToFrame(side, gCur, bones, localRots, arm)
 
         // First pass solve
         let sol = solveArmAndPalm(targetPos)
@@ -1313,7 +1321,7 @@ export function solveMotionIntent(
             pinkyCurl: gCur.pinkyCurl * relaxRatio,
             spread: Math.min(0.15, gCur.spread),
           }
-          applyHandGripToFrame(side, gCur, bones, localRots)
+          applyHandGripToFrame(side, gCur, bones, localRots, arm)
           pen = measureRealHandPenetration(sol)
         }
 
@@ -1365,7 +1373,7 @@ export function solveMotionIntent(
               ringCurl: c01(gCur.ringCurl + fingerDrag * 1.1),
               pinkyCurl: c01(gCur.pinkyCurl + fingerDrag * 1.2),
               spread: gCur.spread,
-            }, bones, localRots)
+            }, bones, localRots, arm)
           }
         }
 
@@ -1389,7 +1397,7 @@ export function solveMotionIntent(
         wristVelSprings[side].x.step(dt, 0, 4.2, 0.62, 0.25)
         wristVelSprings[side].y.step(dt, 0, 4.2, 0.62, 0.25)
         wristVelSprings[side].z.step(dt, 0, 4.2, 0.62, 0.25)
-        applyHandGripToFrame(side, gCur, bones, localRots)
+        applyHandGripToFrame(side, gCur, bones, localRots, arm)
       }
     }
 
@@ -1514,15 +1522,15 @@ export function solveMotionIntent(
           continue
         }
 
-        const drag = isHair ? 0.78 : 0.82
-        const stiffness = isHair
+        const drag = node.damping ?? (isHair ? 0.78 : 0.82)
+        const stiffness = node.stiffness ?? (isHair
           ? Math.max(0.18, 0.36 - node.depth * 0.04)
-          : Math.max(0.14, 0.30 - node.depth * 0.018)
+          : Math.max(0.14, 0.30 - node.depth * 0.018))
         const gravity = isHair ? 14.0 : 28.0
         // Cone clamp measured against targetDrapeDir (anchored to rigid skeleton + gravity, NEVER compounds per-link curl!)
-        const maxConeDeg = isHair
+        const maxConeDeg = node.maxConeDeg ?? (isHair
           ? Math.min(22, 10 + node.depth * 3.0)
-          : Math.min(28, 12 + node.depth * 2.2)
+          : Math.min(28, 12 + node.depth * 2.2))
 
         const vel = vScale(vSub(curTip, prevTip), drag)
         const springPull = vScale(vSub(restTip, curTip), stiffness)

@@ -10,6 +10,13 @@
  *   0x0800 local axes · 0x1000 after-physics · 0x2000 external parent · 0x0020 IK
  */
 
+export interface PmxIkLink {
+  bone: number
+  hasLimit: boolean
+  minRad?: [number, number, number]
+  maxRad?: [number, number, number]
+}
+
 export interface PmxBone {
   jp: string
   en: string
@@ -22,12 +29,22 @@ export interface PmxBone {
    *  D 链视觉骨骼靠它跟随标准链，如 左足D→付与→左足 ratio=1；
    *  腰キャンセル 付与 腰 ratio=-1 用于抵消上半身弯腰对腿的影响）。 */
   grant?: { parent: number; ratio: number; rotate: boolean; move: boolean }
+  /** PMX fixed rotation axis (flags & 0x0400), e.g. 腕捩 / 手捩. */
+  fixedAxis?: [number, number, number]
+  /** PMX local coordinate axes (flags & 0x0800). */
+  localAxes?: { x: [number, number, number]; z: [number, number, number] }
+  /** PMX IK chain links & angle limits (flags & 0x0020). */
+  ikLinks?: PmxIkLink[]
 }
 
 export interface PmxRigid {
   jp: string
   /** Attached bone index. */
   bone: number
+  /** Collision group (0..15). */
+  group?: number
+  /** Non-collision group bitmask. */
+  nonCollisionMask?: number
   /** 0 = sphere, 1 = box, 2 = capsule */
   shape?: 0 | 1 | 2
   /** [width/radius, height, depth] */
@@ -36,8 +53,25 @@ export interface PmxRigid {
   pos?: [number, number, number]
   /** Euler XYZ in radians */
   rot?: [number, number, number]
+  mass?: number
+  linearDamp?: number
+  angularDamp?: number
   /** 0 = bone-driven, 1 = physics, 2 = physics+bone */
   mode?: number
+}
+
+export interface PmxJoint {
+  jp: string
+  rigidA: number
+  rigidB: number
+  pos: [number, number, number]
+  rot: [number, number, number]
+  moveMin: [number, number, number]
+  moveMax: [number, number, number]
+  rotMin: [number, number, number]
+  rotMax: [number, number, number]
+  springMove: [number, number, number]
+  springRot: [number, number, number]
 }
 
 export interface BoneEnvelope {
@@ -90,6 +124,7 @@ export interface PmxBones {
   modelName: string
   bones: PmxBone[]
   rigids: PmxRigid[]
+  joints?: PmxJoint[]
   /** Vertex (face) morph names — the model's usable expressions. */
   faceMorphs: string[]
   /** Complete catalog of all PMX morphs across all kinds (group/vertex/bone/UV/material) with panel category. */
@@ -152,20 +187,20 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
   const version = r.f32()
   const gCount = r.u8()
   const g = Array.from({ length: gCount }, () => r.u8())
-  const [enc, addUV, vIdx, texIdx, matIdx, boneIdx, morphIdx] = g as [
-    number, number, number, number, number, number, number,
+  const [enc, addUV, vIdx, texIdx, matIdx, boneIdx, morphIdx, rbIdx] = g as [
+    number, number, number, number, number, number, number, number,
   ]
-  // (globals[7] rigidbody index size unused: we only record rigid→bone links)
 
   const modelName = r.str(enc as 0 | 1)
   r.str(enc as 0 | 1)
   r.str(enc as 0 | 1)
   r.str(enc as 0 | 1)
 
-  // vertices — record position + primary skin bone so we can build real body envelopes
+  // vertices — record position + primary & significant secondary skin bones
   const vCount = r.i32()
   const vPos = new Float32Array(vCount * 3)
   const vBone = new Int32Array(vCount)
+  const vBone2 = new Int32Array(vCount).fill(-1)
   for (let i = 0; i < vCount; i++) {
     vPos[i * 3] = r.f32()
     vPos[i * 3 + 1] = r.f32()
@@ -173,6 +208,7 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     r.raw(20 + addUV * 16) // normal(12) + uv(8) + addUV*16
     const wt = r.u8()
     let primary = -1
+    let secondary = -1
     if (wt === 0) {
       primary = r.idx(boneIdx)
     } else if (wt === 1) {
@@ -180,6 +216,8 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
       const b1 = r.idx(boneIdx)
       const w0 = r.f32()
       primary = w0 >= 0.5 ? b0 : b1
+      const wSec = w0 >= 0.5 ? 1 - w0 : w0
+      if (wSec >= 0.25) secondary = w0 >= 0.5 ? b1 : b0
     } else if (wt === 2 || wt === 4) {
       const b0 = r.idx(boneIdx), b1 = r.idx(boneIdx), b2 = r.idx(boneIdx), b3 = r.idx(boneIdx)
       const w0 = r.f32(), w1 = r.f32(), w2 = r.f32(), w3 = r.f32()
@@ -188,12 +226,21 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
       let best = 0
       for (let k = 1; k < 4; k++) if (ws[k] > ws[best]) best = k
       primary = bs[best]
+      let second = -1, secondW = 0.25
+      for (let k = 0; k < 4; k++) {
+        if (k !== best && ws[k] >= secondW) { second = bs[k]; secondW = ws[k] }
+      }
+      secondary = second
     } else if (wt === 3) {
       primary = r.idx(boneIdx)
-      r.idx(boneIdx)
-      r.raw(60) // SDEF C1,C2,R0,R1,R2
+      const b1 = r.idx(boneIdx)
+      const w0 = r.f32()
+      if (1 - w0 >= 0.25 && w0 >= 0.5) secondary = b1
+      else if (w0 >= 0.25 && w0 < 0.5) { secondary = primary; primary = b1 }
+      r.raw(36) // SDEF C(12), R0(12), R1(12) after b0, b1, w0
     }
     vBone[i] = primary
+    vBone2[i] = secondary
     r.raw(4)
   }
 
@@ -214,9 +261,10 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
   const HAIR_RE = /髪|hair|头发|髮|bang|ponytail|ツインテ/i
   const FACE_RE = /顔|脸|face/i
   const EYE_MOUTH_RE = /eye|目|瞳|眉|brow|lash|まつげ|口|mouth|teeth|歯|舌|白目|ハイライト/i
-  const SOFT_RE = /skirt|スカート|裙|ribbon|リボン|丝带|帯|cape|マント|披风|tie|ネクタイ|飾|accessory|tassel|流苏/i
+  const SOFT_RE = /skirt|スカート|裙|ribbon|リボン|丝带|帯|cape|マント|披风|tie|ネクタイ|飾|accessory|tassel|流苏|外套|衣带|衣摆|披肩|斗篷|袖|coat|sleeve|collar/i
 
   const mCount = r.i32()
+  const matRanges: Array<{ start: number; end: number; tag: number }> = []
   let faceCursor = 0
   for (let i = 0; i < mCount; i++) {
     const matJp = r.str(enc as 0 | 1)
@@ -237,8 +285,9 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     else if (FACE_RE.test(name) && !EYE_MOUTH_RE.test(name)) tag |= TAG_FACE_SKIN
     if (SOFT_RE.test(name)) tag |= TAG_SOFT_CLOTH
 
+    const end = Math.min(fCount, faceCursor + mFaceCount)
+    matRanges.push({ start: faceCursor, end, tag })
     if (tag !== 0) {
-      const end = Math.min(fCount, faceCursor + mFaceCount)
       for (let k = faceCursor; k < end; k++) {
         const vi = faceVerts[k]
         if (vi < vCount) vTag[vi] |= tag
@@ -268,23 +317,44 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
       const ratio = r.f32()
       grant = { parent: gp, ratio, rotate: !!(flags & 0x0100), move: !!(flags & 0x0200) }
     }
-    if (flags & 0x0400) r.raw(12)
-    if (flags & 0x0800) r.raw(24)
+    let fixedAxis: PmxBone["fixedAxis"]
+    if (flags & 0x0400) fixedAxis = [r.f32(), r.f32(), r.f32()]
+    let localAxes: PmxBone["localAxes"]
+    if (flags & 0x0800) {
+      localAxes = {
+        x: [r.f32(), r.f32(), r.f32()],
+        z: [r.f32(), r.f32(), r.f32()],
+      }
+    }
     if (flags & 0x2000) r.raw(4)
     let ik = false
+    let ikLinks: PmxIkLink[] | undefined
     if (flags & 0x0020) {
       ik = true
       r.idx(boneIdx)
       r.raw(8) // loop count + unit angle
       const links = r.i32()
+      ikLinks = []
       for (let l = 0; l < links; l++) {
-        r.idx(boneIdx)
+        const linkBone = r.idx(boneIdx)
         const lim = r.u8()
-        if (lim) r.raw(24)
+        if (lim) {
+          const minRad: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+          const maxRad: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+          ikLinks.push({ bone: linkBone, hasLimit: true, minRad, maxRad })
+        } else {
+          ikLinks.push({ bone: linkBone, hasLimit: false })
+        }
       }
     }
     indexByJp.set(jp, i)
-    bones.push({ jp, en, pos, parent, ik, ...(grant ? { grant } : {}) })
+    bones.push({
+      jp, en, pos, parent, ik,
+      ...(grant ? { grant } : {}),
+      ...(fixedAxis ? { fixedAxis } : {}),
+      ...(localAxes ? { localAxes } : {}),
+      ...(ikLinks ? { ikLinks } : {}),
+    })
   }
 
   // morphs (collect all morph metadata + extract exact 3D facial landmarks from まばたき / あ / 照れ)
@@ -338,9 +408,11 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
         for (let k = 0; k < n; k++) { r.uidx(vIdx); r.raw(12) }
       }
     }
-    else if (kind === 2) { for (let k = 0; k < n; k++) { r.idx(boneIdx); r.raw(12) } }
+    else if (kind === 2) { for (let k = 0; k < n; k++) { r.idx(boneIdx); r.raw(28) } } // translation(12) + rotation(16)
     else if (kind >= 3 && kind <= 7) { for (let k = 0; k < n; k++) { r.uidx(vIdx); r.raw(16) } }
     else if (kind === 8) { for (let k = 0; k < n; k++) { r.idx(matIdx); r.i8(); r.raw(112) } } // diffuse4+spec3+shin+ambient3+edge4+edgeSize+3×factor4
+    else if (kind === 9) { for (let k = 0; k < n; k++) { r.idx(morphIdx); r.raw(4) } } // flip morph: morphIdx + weight(4)
+    else if (kind === 10) { const sRb = rbIdx === 1 || rbIdx === 2 || rbIdx === 4 ? rbIdx : 2; for (let k = 0; k < n; k++) { r.idx(sRb); r.raw(25) } } // impulse: rbIdx + localFlag(1) + vel(12) + torque(12)
   }
 
   // display frames
@@ -359,17 +431,43 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     const jp = r.str(enc as 0 | 1)
     r.str(enc as 0 | 1)
     const bone = r.idx(boneIdx)
-    r.raw(3) // group(1) + nonCollisionMask(2)
+    const group = r.u8()
+    const nonCollisionMask = r.dv.getUint16(r.o, true); r.o += 2
     const shapeByte = r.u8()
     const shape: 0 | 1 | 2 = shapeByte === 0 ? 0 : shapeByte === 1 ? 1 : 2
     const size: [number, number, number] = [r.f32(), r.f32(), r.f32()]
     const pos: [number, number, number] = [r.f32(), r.f32(), r.f32()]
     const rot: [number, number, number] = [r.f32(), r.f32(), r.f32()]
-    r.raw(20) // mass + linearDamp + angularDamp + restitution + friction
+    const mass = r.f32()
+    const linearDamp = r.f32()
+    const angularDamp = r.f32()
+    r.raw(8) // restitution + friction
     const mode = r.u8()
-    rigids.push({ jp, bone, shape, size, pos, rot, mode })
+    rigids.push({ jp, bone, group, nonCollisionMask, shape, size, pos, rot, mass, linearDamp, angularDamp, mode })
   }
-  // (joints and any trailing data are irrelevant to the skeleton reader)
+
+  // joints (spring / 6-DOF limits between rigid bodies)
+  const joints: PmxJoint[] = []
+  if (r.o + 4 <= r.bytes.length) {
+    const jCount = r.i32()
+    const safeRbIdx = rbIdx === 1 || rbIdx === 2 || rbIdx === 4 ? rbIdx : 2
+    for (let i = 0; i < jCount && r.o < r.bytes.length; i++) {
+      const jp = r.str(enc as 0 | 1)
+      r.str(enc as 0 | 1) // en
+      r.u8() // joint type (0..5; PMX 2.0/2.1 stores full 6-DOF block)
+      const rigidA = r.idx(safeRbIdx)
+      const rigidB = r.idx(safeRbIdx)
+      const pos: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const rot: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const moveMin: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const moveMax: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const rotMin: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const rotMax: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const springMove: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      const springRot: [number, number, number] = [r.f32(), r.f32(), r.f32()]
+      joints.push({ jp, rigidA, rigidB, pos, rot, moveMin, moveMax, rotMin, rotMax, springMove, springRot })
+    }
+  }
 
   // Name-independent physics soft-bone detection: bones driven by mode=1/2 physics rigids (hair/skirt/ribbon/tassels)
   const CORE_PROTECTED_JP = new Set([
@@ -381,6 +479,25 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
   for (const rb of rigids) {
     if ((rb.mode === 1 || rb.mode === 2) && rb.bone >= 0 && rb.bone < bones.length) {
       if (!CORE_PROTECTED_JP.has(bones[rb.bone].jp)) physicsSoftBones.add(rb.bone)
+    }
+  }
+
+  // Topology fallback for untagged materials: if >=60% of vertices in a material are skinned to physicsSoftBones, tag as softCloth
+  for (const mr of matRanges) {
+    if ((mr.tag & (TAG_HAIR | TAG_SOFT_CLOTH | TAG_FACE_SKIN)) !== 0) continue
+    let total = 0, phys = 0
+    for (let k = mr.start; k < mr.end; k++) {
+      const vi = faceVerts[k]
+      if (vi < vCount) {
+        total++
+        if (physicsSoftBones.has(vBone[vi])) phys++
+      }
+    }
+    if (total >= 12 && phys / total >= 0.6) {
+      for (let k = mr.start; k < mr.end; k++) {
+        const vi = faceVerts[k]
+        if (vi < vCount) vTag[vi] |= TAG_SOFT_CLOTH
+      }
     }
   }
 
@@ -411,20 +528,23 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
   }
 
   for (let i = 0; i < vCount; i++) {
-    const bi = vBone[i]
-    if (bi < 0 || bi >= bones.length) continue
-    const bone = bones[bi]
-    const x = vPos[i * 3], y = vPos[i * 3 + 1], z = vPos[i * 3 + 2]
-    const d = Math.hypot(x - bone.pos[0], y - bone.pos[1], z - bone.pos[2])
-    accEnv(envelopes, bone.jp, x, y, z, d)
     const tag = vTag[i]
-    if ((tag & (TAG_HAIR | TAG_SOFT_CLOTH)) === 0 && !physicsSoftBones.has(bi)) {
-      accEnv(coreEnvelopes, bone.jp, x, y, z, d)
-    }
-    if ((tag & TAG_FACE_SKIN) !== 0 && bone.jp === "頭") {
-      const tmp: Record<string, BoneEnvelope> = faceSkinEnvelope ? { face: faceSkinEnvelope } : {}
-      accEnv(tmp, "face", x, y, z, d)
-      faceSkinEnvelope = tmp.face
+    const x = vPos[i * 3], y = vPos[i * 3 + 1], z = vPos[i * 3 + 2]
+    const biList = vBone2[i] >= 0 && vBone2[i] !== vBone[i] ? [vBone[i], vBone2[i]] : [vBone[i]]
+    for (let bIdxPos = 0; bIdxPos < biList.length; bIdxPos++) {
+      const bi = biList[bIdxPos]
+      if (bi < 0 || bi >= bones.length) continue
+      const bone = bones[bi]
+      const d = Math.hypot(x - bone.pos[0], y - bone.pos[1], z - bone.pos[2])
+      accEnv(envelopes, bone.jp, x, y, z, d)
+      if ((tag & (TAG_HAIR | TAG_SOFT_CLOTH)) === 0 && !physicsSoftBones.has(bi)) {
+        accEnv(coreEnvelopes, bone.jp, x, y, z, d)
+      }
+      if (bIdxPos === 0 && (tag & TAG_FACE_SKIN) !== 0 && bone.jp === "頭") {
+        const tmp: Record<string, BoneEnvelope> = faceSkinEnvelope ? { face: faceSkinEnvelope } : {}
+        accEnv(tmp, "face", x, y, z, d)
+        faceSkinEnvelope = tmp.face
+      }
     }
   }
 
@@ -558,6 +678,7 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
         if (vBone[i] !== upperIdx || (vTag[i] & (TAG_HAIR | TAG_SOFT_CLOTH)) !== 0) continue
         const x = vPos[i * 3], y = vPos[i * 3 + 1], z = vPos[i * 3 + 2]
         if (Math.abs(y - waistY) > 0.35 || Math.abs(z - waistZ) > 0.55) continue
+        if (x * side < 0.25) continue
         if (x * side > bestX) {
           bestX = x * side
           bestP = [round2(x), round2(y), round2(z)]
@@ -590,6 +711,7 @@ export function parsePmxBones(data: Uint8Array): PmxBones {
     modelName,
     bones,
     rigids,
+    ...(joints.length > 0 ? { joints } : {}),
     faceMorphs,
     allMorphs,
     indexByJp,

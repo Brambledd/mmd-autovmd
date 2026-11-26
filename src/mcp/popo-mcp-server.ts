@@ -43,7 +43,7 @@ import { LEXICON, expandLexiconSegment } from "../lib/motion-lexicon.ts"
 import { critiquePoseVmd, parsePoseTextsAndTimeline } from "../lib/pose-critic.ts"
 import { auditVmd } from "../lib/pose-audit.ts"
 import { buildBoneTracks, readVmdBoneKeys, samplePoseTransforms } from "../lib/fk.ts"
-import { buildRigProfile } from "../lib/rig-profile.ts"
+import { buildRigProfile, RIG_PROFILE_VERSION } from "../lib/rig-profile.ts"
 import { solveMotionIntent, type MotionIntent } from "../lib/rig-solver.ts"
 import { renderPoseMultiViewPng, renderStoryboardPng, renderDuoMultiViewPng, renderDuoStoryboardPng } from "../lib/pose-renderer.ts"
 import { getServerCompiler } from "../lib/server-compile.ts"
@@ -1821,13 +1821,18 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
     const pmxAbs = entry.pmxPath ?? path.join(PUBLIC_DIR, entry.url.replace(/^\/+/, ""))
     const profilePath = path.join(path.dirname(pmxAbs), `${entry.id}.rig-profile.json`)
     const rebuild = args.rebuildProfile === true
-    const profile = !rebuild && fs.existsSync(profilePath)
-      ? JSON.parse(fs.readFileSync(profilePath, "utf8"))
-      : (() => {
-          const built = buildRigProfile(bones, entry.id)
-          try { fs.writeFileSync(profilePath, JSON.stringify(built, null, 2)) } catch { /* ignore read-only */ }
-          return built
-        })()
+    let cachedProfile: ReturnType<typeof buildRigProfile> | null = null
+    if (!rebuild && fs.existsSync(profilePath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(profilePath, "utf8"))
+        if (parsed?.version === RIG_PROFILE_VERSION) cachedProfile = parsed
+      } catch { /* rebuild */ }
+    }
+    const profile = cachedProfile ?? (() => {
+      const built = buildRigProfile(bones, entry.id)
+      try { fs.writeFileSync(profilePath, JSON.stringify(built, null, 2)) } catch { /* ignore read-only */ }
+      return built
+    })()
 
     const solved = solveMotionIntent(intent, profile, bones)
     const outRel = typeof args.outVmdPath === "string" && args.outVmdPath.trim()
@@ -1859,7 +1864,7 @@ async function handleToolCall(name: string, args: Record<string, unknown>) {
               morphKeyCount: solved.morphKeyCount,
               solveTimeMs: solved.solveTimeMs,
               critic,
-              audit,
+              audit: audit ? { violations: audit.violations } : null,
               groundContact: ground,
             },
             null,

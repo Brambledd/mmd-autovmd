@@ -111,7 +111,8 @@ export function buildModelConditioning(bones: PmxBones): ModelConditioning {
   const skirtRigids = bones.rigids.filter((r) => {
     const b = bones.bones[r.bone]
     if (!b) return false
-    return /skirt|スカート|裙/i.test(b.en) || /裙|スカート/.test(b.jp)
+    const text = `${r.jp} ${b.jp} ${b.en}`
+    return /skirt|スカート|裙|外套|衣摆|coat|cape|披风/i.test(text)
   }).length
 
   const lines: string[] = []

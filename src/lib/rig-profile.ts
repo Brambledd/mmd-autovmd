@@ -25,6 +25,11 @@ export interface SpineLink {
   maxDeg: number
 }
 
+export interface FingerAxisSpec {
+  curlAxis: V3
+  spreadAxis: V3
+}
+
 export interface ArmRig {
   side: "l" | "r"
   shoulderJp: string
@@ -45,6 +50,12 @@ export interface ArmRig {
   restFingerDir: V3
   /** Rest unit outward palm normal in model space (measured from wrist/index/pinky) */
   restPalmNormal: V3
+  /** PMX fixed rotation axis for upper-arm twist bone if present */
+  armTwistAxis?: V3
+  /** PMX fixed rotation axis for forearm/wrist twist bone if present */
+  wristTwistAxis?: V3
+  /** Per-finger anatomical curl & spread axes derived from PMX localAxes or knuckle geometry */
+  fingerAxes?: Record<string, FingerAxisSpec>
   /** Fraction of arm elevation automatically coupled to clavicle/shoulder */
   shoulderCoupling: number
 }
@@ -60,6 +71,10 @@ export interface LegRig {
   restHipPos: V3
   restAnklePos: V3
   restFootMinY: number
+  /** Vertical distance from sole bottom to ankle joint (detects heels/boots) */
+  heelHeight?: number
+  /** Front-back foot span (toe to heel) in u */
+  footLength?: number
   hasLegIk: boolean
 }
 
@@ -130,6 +145,12 @@ export interface PhysicsChainNode {
   restDir: V3
   /** Segment length in u */
   segLen: number
+  /** PMX joint-derived cone angle limit (degrees) */
+  maxConeDeg?: number
+  /** PMX joint-derived spring stiffness (0..1) */
+  stiffness?: number
+  /** PMX rigid-body-derived velocity drag (0..1) */
+  damping?: number
 }
 
 export interface SoftTissueRig {
@@ -144,8 +165,17 @@ export interface SoftTissueRig {
   physicsNodes: PhysicsChainNode[]
 }
 
+export interface GarmentProfile {
+  hasSkirtOrLongCoat: boolean
+  lowerClothNodes: number
+  lowerClothClearanceRadius: number
+  headToBodyRatio: number
+}
+
+export const RIG_PROFILE_VERSION = "1.1" as const
+
 export interface RigProfile {
-  version: "1.0"
+  version: "1.0" | "1.1"
   modelId: string
   modelName: string
   measurements: ModelMeasurements
@@ -165,6 +195,8 @@ export interface RigProfile {
   jointRom: JointRomSpec
   /** Discovered soft-tissue, elastic groove, and non-facial morph channels */
   softTissue: SoftTissueRig
+  /** Auto-discovered garment & proportion summary for motion constraints */
+  garmentProfile?: GarmentProfile
   /** Optional per-model calibration notes */
   calibrationNotes: string[]
 }
@@ -202,6 +234,22 @@ function qMul(a: Quat, b: Quat): Quat {
   }
 }
 
+function qFromTwoVectors3D(a: V3, b: V3): Quat {
+  const va = vNorm(a)
+  const vb = vNorm(b)
+  const d = vDot(va, vb)
+  if (d > 0.9999) return { x: 0, y: 0, z: 0, w: 1 }
+  if (d < -0.9999) {
+    const ortho = Math.abs(va[0]) < 0.8 ? vCross(va, [1, 0, 0]) : vCross(va, [0, 1, 0])
+    const ax = vNorm(ortho)
+    return { x: r2(ax[0]), y: r2(ax[1]), z: r2(ax[2]), w: 0 }
+  }
+  const c = vCross(va, vb)
+  const s = Math.sqrt((1 + d) * 2)
+  const invS = 1 / s
+  return { x: r2(c[0] * invS), y: r2(c[1] * invS), z: r2(c[2] * invS), w: r2(s * 0.5) }
+}
+
 function toV3(p: Vec3 | undefined | null, fallback: V3 = [0, 0, 0]): V3 {
   return p ? [p.x, p.y, p.z] : fallback
 }
@@ -211,27 +259,27 @@ function toV3(p: Vec3 | undefined | null, fallback: V3 = [0, 0, 0]): V3 {
 // Multi-channel semantic expressions: separate EYEBROW / EYE / MOUTH so gentle smiles keep eyes OPEN!
 const SEMANTIC_MORPH_CANDIDATES: Record<string, string[][]> = {
   // Natural open-eye smile: gentle brows (にこり) + lifted mouth corners (口角上げ), eyes stay OPEN!
-  smile: [["にこり", "口角上げ"], ["口角上げ"], ["にこり"]],
-  warm_smile: [["にこり", "口角上げ"], ["口角上げ"], ["にこり"]],
+  smile: [["にこり", "口角上げ"], ["口角上げ"], ["にこり"], ["smile"], ["Smile"], ["微笑"]],
+  warm_smile: [["にこり", "口角上げ"], ["口角上げ"], ["にこり"], ["smile"], ["Smile"], ["微笑"]],
   // Explicit eye-closing smiles (only squint/close eyes when requested!)
-  happy_squint: [["なごみ", "口角上げ"], ["なごみ"]],
-  laugh: [["笑い", "ワ"], ["笑い"], ["笑い1"]],
-  shy: [["照れ"]],
-  serious: [["真面目"], ["真面目_L", "真面目_R"]],
-  sharp: [["ｷﾘｯ"], ["ｷﾘｯ_L", "ｷﾘｯ_R"]],
-  troubled: [["困る"]],
-  surprised: [["びっくり"], ["びっくり_L", "びっくり_R"]],
-  angry: [["怒り"]],
-  smirk: [["にやり２"]],
-  blink: [["まばたき"]],
-  wink_l: [["ウィンク"], ["ウィンク２"]],
-  wink_r: [["ウィンク右"], ["ｳｨﾝｸ２右"]],
-  mouth_a: [["あ"], ["あ２"]],
-  mouth_i: [["い"]],
-  mouth_u: [["う"]],
-  mouth_e: [["え"]],
-  mouth_o: [["お"]],
-  grin: [["ワ"], ["あ"]],
+  happy_squint: [["なごみ", "口角上げ"], ["なごみ"], ["happy"], ["Happy"]],
+  laugh: [["笑い", "ワ"], ["笑い"], ["笑い1"], ["laugh"], ["Laugh"], ["笑"]],
+  shy: [["照れ"], ["blush"], ["Blush"], ["shy"], ["脸红"]],
+  serious: [["真面目"], ["真面目_L", "真面目_R"], ["serious"], ["Serious"]],
+  sharp: [["ｷﾘｯ"], ["ｷﾘｯ_L", "ｷﾘｯ_R"], ["sharp"]],
+  troubled: [["困る"], ["troubled"], ["Sad"], ["sad"]],
+  surprised: [["びっくり"], ["びっくり_L", "びっくり_R"], ["surprised"], ["Surprised"]],
+  angry: [["怒り"], ["angry"], ["Angry"]],
+  smirk: [["にやり２"], ["にやり"], ["smirk"], ["Smirk"]],
+  blink: [["まばたき"], ["blink"], ["Blink"], ["眨眼"]],
+  wink_l: [["ウィンク"], ["ウィンク２"], ["wink_l"], ["Wink_L"]],
+  wink_r: [["ウィンク右"], ["ｳｨﾝｸ２右"], ["wink_r"], ["Wink_R"]],
+  mouth_a: [["あ"], ["あ２"], ["A"], ["a"]],
+  mouth_i: [["い"], ["I"], ["i"]],
+  mouth_u: [["う"], ["U"], ["u"]],
+  mouth_e: [["え"], ["E"], ["e"]],
+  mouth_o: [["お"], ["O"], ["o"]],
+  grin: [["ワ"], ["あ"], ["grin"], ["Grin"]],
 }
 
 function buildMorphMap(faceMorphs: string[]): Record<string, string[]> {
@@ -278,28 +326,26 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
   }
   const has = (jp: string) => bones.indexByJp.has(jp)
 
-  // 1. Neutral Pose calibration (convert A/T-pose into relaxed standing zero-point)
+  // 1. Neutral Pose calibration (full 3D vector alignment from any A/T-pose into relaxed standing zero-point)
   const restBelowHoriz = m.armRestAngleDeg ?? 35
-  // Natural relaxed arm hangs ~78° below horizontal (~12° off vertical)
   const targetBelowHoriz = 78
-  const armDropDeg = Math.max(0, Math.min(72, targetBelowHoriz - restBelowHoriz))
-  notes.push(`A-pose arm rest ${restBelowHoriz}° below horizontal → Neutral Pose drops arms by ${armDropDeg.toFixed(1)}°`)
-
-  // MMD coordinate system: +X = model left, +Y = up, -Z = forward
-  // Rotating left arm (+X) downward (-Y) is a NEGATIVE rotation around +Z (right-hand rule: +Z × +X = +Y)
+  const rad78 = (targetBelowHoriz * Math.PI) / 180
   const neutralPose: Record<string, Quat> = {}
-  if (has("左腕")) {
-    neutralPose["左腕"] = qMul(
-      qFromAxisAngle([0, 0, 1], -armDropDeg),
-      qFromAxisAngle([0, 1, 0], 6), // slight natural forward drift
-    )
+  for (const side of ["l", "r"] as const) {
+    const p = side === "l" ? "左" : "右"
+    const s = side === "l" ? 1 : -1
+    const armP = getPos(`${p}腕`)
+    const elbP = getPos(`${p}ひじ`)
+    if (has(`${p}腕`) && armP && elbP && vLen(vSub(elbP, armP)) > 1e-4) {
+      const restDir = vNorm(vSub(elbP, armP))
+      const targetDir = vNorm([s * Math.cos(rad78), -Math.sin(rad78), -0.10])
+      neutralPose[`${p}腕`] = qFromTwoVectors3D(restDir, targetDir)
+    } else if (has(`${p}腕`)) {
+      const armDropDeg = Math.max(0, Math.min(72, targetBelowHoriz - restBelowHoriz))
+      neutralPose[`${p}腕`] = qMul(qFromAxisAngle([0, 0, 1], -s * armDropDeg), qFromAxisAngle([0, 1, 0], s * 6))
+    }
   }
-  if (has("右腕")) {
-    neutralPose["右腕"] = qMul(
-      qFromAxisAngle([0, 0, 1], armDropDeg),
-      qFromAxisAngle([0, 1, 0], -6),
-    )
-  }
+  notes.push(`Neutral Pose 3D calibrated from rest upper-arm dir (rest slope ${restBelowHoriz}° → target ${targetBelowHoriz}° relaxed drape)`)
   // Slight natural elbow flexion (~12° forward) so arms never look locked straight
   if (has("左ひじ")) neutralPose["左ひじ"] = qFromAxisAngle([0, 1, 0], 12)
   if (has("右ひじ")) neutralPose["右ひじ"] = qFromAxisAngle([0, 1, 0], -12)
@@ -357,13 +403,61 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       }
     }
 
+    const armTwistJp = has(`${p}腕捩`) ? `${p}腕捩` : null
+    const wristTwistJp = has(`${p}手捩`) ? `${p}手捩` : null
+    const getFixedAxis = (jp: string | null): V3 | undefined => {
+      if (!jp) return undefined
+      const idx = bones.indexByJp.get(jp)
+      const fa = idx != null ? bones.bones[idx]?.fixedAxis : undefined
+      return fa && vLen(fa) > 1e-4 ? v3r(vNorm(fa)) : undefined
+    }
+
+    // Derive per-finger anatomical curlAxis & spreadAxis from PMX localAxes or rest knuckle geometry
+    const fingerAxes: Record<string, FingerAxisSpec> = {}
+    const defaultCurlAxis: V3 = vNorm(vCross(restFingerDir, restPalmNormal))
+    const palmUp = vNorm([-restPalmNormal[0], -restPalmNormal[1], -restPalmNormal[2]])
+    const defaultSpreadAxis: V3 = vDot(palmUp, [0, 1, 0]) >= 0 ? palmUp : [0, 1, 0]
+    const fingerGroups: Array<{ prefix: string; segs: string[]; isThumb?: boolean }> = [
+      { prefix: "人指", segs: ["１", "２", "３"] },
+      { prefix: "中指", segs: ["１", "２", "３"] },
+      { prefix: "薬指", segs: ["１", "２", "３"] },
+      { prefix: "小指", segs: ["１", "２", "３"] },
+      { prefix: "親指", segs: ["０", "１", "２"], isThumb: true },
+    ]
+    for (const grp of fingerGroups) {
+      for (let k = 0; k < grp.segs.length; k++) {
+        const jp = `${p}${grp.prefix}${grp.segs[k]}`
+        const bIdx = bones.indexByJp.get(jp)
+        if (bIdx == null) continue
+        const la = bones.bones[bIdx]?.localAxes
+        if (la && vLen(la.x) > 1e-4 && vLen(la.z) > 1e-4) {
+          const lx = vNorm(la.x)
+          const lz = vNorm(la.z)
+          const ly = vNorm(vCross(lz, lx))
+          const curlAxis = vDot(lz, defaultCurlAxis) >= 0 ? lz : ([-lz[0], -lz[1], -lz[2]] as V3)
+          const spreadAxis = vDot(ly, defaultSpreadAxis) >= 0 ? ly : ([-ly[0], -ly[1], -ly[2]] as V3)
+          fingerAxes[jp] = { curlAxis: v3r(curlAxis), spreadAxis: v3r(spreadAxis) }
+        } else {
+          const curP = getPos(jp)
+          const nextJp = k + 1 < grp.segs.length ? `${p}${grp.prefix}${grp.segs[k + 1]}` : null
+          const nextP = nextJp ? getPos(nextJp) : null
+          const segDir = curP && nextP && vLen(vSub(nextP, curP)) > 1e-4 ? vNorm(vSub(nextP, curP)) : restFingerDir
+          const rawCurl = vCross(segDir, restPalmNormal)
+          const curlAxis = vLen(rawCurl) > 1e-4
+            ? (vDot(rawCurl, defaultCurlAxis) >= 0 ? vNorm(rawCurl) : vNorm([-rawCurl[0], -rawCurl[1], -rawCurl[2]]))
+            : defaultCurlAxis
+          fingerAxes[jp] = { curlAxis: v3r(curlAxis), spreadAxis: v3r(defaultSpreadAxis) }
+        }
+      }
+    }
+
     return {
       side,
       shoulderJp: `${p}肩`,
       armJp: `${p}腕`,
-      armTwistJp: has(`${p}腕捩`) ? `${p}腕捩` : null,
+      armTwistJp,
       elbowJp: `${p}ひじ`,
-      wristTwistJp: has(`${p}手捩`) ? `${p}手捩` : null,
+      wristTwistJp,
       wristJp: `${p}手首`,
       upperLen: r2(vLen(upperVec)),
       foreLen: r2(vLen(foreVec)),
@@ -372,6 +466,9 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       restForeDir: v3r(vNorm(foreVec)),
       restFingerDir: v3r(restFingerDir),
       restPalmNormal: v3r(restPalmNormal),
+      ...(getFixedAxis(armTwistJp) ? { armTwistAxis: getFixedAxis(armTwistJp) } : {}),
+      ...(getFixedAxis(wristTwistJp) ? { wristTwistAxis: getFixedAxis(wristTwistJp) } : {}),
+      ...(Object.keys(fingerAxes).length > 0 ? { fingerAxes } : {}),
       shoulderCoupling: 0.28,
     }
   }
@@ -387,7 +484,13 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
     const ankleP = getPos(`${p}足首`) ?? [s * 0.9, 1.5, 0.4]
     const toeJp = has(`${p}足先EX`) ? `${p}足先EX` : has(`${p}つま先`) ? `${p}つま先` : null
     const toeEnv = toeJp ? env[toeJp] : undefined
-    const restFootMinY = toeEnv ? r2(toeEnv.min[1]) : 0
+    const ankleEnv = env[`${p}足首`]
+    const footEnvs = [ankleEnv, toeEnv].filter((e): e is NonNullable<typeof e> => Boolean(e && e.count > 0))
+    const restFootMinY = footEnvs.length > 0 ? r2(Math.min(...footEnvs.map((e) => e.min[1]))) : 0
+    const heelHeight = r2(Math.max(0.2, ankleP[1] - restFootMinY))
+    const footLength = footEnvs.length > 0
+      ? r2(Math.max(...footEnvs.map((e) => e.max[2])) - Math.min(...footEnvs.map((e) => e.min[2])))
+      : undefined
     return {
       side,
       hipJp: `${p}足`,
@@ -399,6 +502,8 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       restHipPos: v3r(hipP),
       restAnklePos: v3r(ankleP),
       restFootMinY,
+      heelHeight,
+      ...(footLength != null ? { footLength } : {}),
       hasLegIk,
     }
   }
@@ -462,21 +567,60 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
   // Pelvis: fuller lower hip (A) -> narrower upper waist (B)
   addTaperedCapsule("pelvis", "下半身", 0.88, 0.72, 1.30)
 
-  // Thighs: fuller upper thigh (A) -> slimmer knee (B)
+  // Thighs & Shins: use real vertex-sliced anatomy when available, with scaled fallback
   for (const side of ["l", "r"] as const) {
     const leg = legs[side]
     const hipP = getPos(leg.hipJp)
     const kneeP = getPos(leg.kneeJp)
+    const ankleP = getPos(leg.ankleJp)
     if (hipP && kneeP) {
+      const thighSlices = boneSlices[leg.hipJp]
       const seg = vSub(kneeP, hipP)
+      if (thighSlices && thighSlices.length >= 2) {
+        const top = thighSlices[thighSlices.length - 1]
+        const bot = thighSlices[0]
+        const rA = r2(Math.max(0.45, Math.min(1.25, (top.rx + top.rz) * 0.5)))
+        const rB = r2(Math.max(0.35, Math.min(0.95, (bot.rx + bot.rz) * 0.5)))
+        capsules.push({
+          id: `thigh_${side}`,
+          boneJp: leg.hipJp,
+          localA: v3r([seg[0] * 0.15, seg[1] * 0.15, seg[2] * 0.15]),
+          localB: v3r([seg[0] * 0.85, seg[1] * 0.85, seg[2] * 0.85]),
+          radiusA: rA,
+          radiusB: rB,
+          radius: Math.max(rA, rB),
+          slices: thighSlices,
+        })
+      } else {
+        capsules.push({
+          id: `thigh_${side}`,
+          boneJp: leg.hipJp,
+          localA: v3r([seg[0] * 0.15, seg[1] * 0.15, seg[2] * 0.15]),
+          localB: v3r([seg[0] * 0.85, seg[1] * 0.85, seg[2] * 0.85]),
+          radiusA: 0.84,
+          radiusB: 0.56,
+          radius: 0.84,
+        })
+      }
+    }
+    if (kneeP && ankleP) {
+      const shinSlices = boneSlices[leg.kneeJp]
+      const seg = vSub(ankleP, kneeP)
+      const rA = shinSlices && shinSlices.length >= 2
+        ? r2(Math.max(0.32, Math.min(0.85, (shinSlices[shinSlices.length - 1].rx + shinSlices[shinSlices.length - 1].rz) * 0.5)))
+        : 0.52
+      const rB = shinSlices && shinSlices.length >= 2
+        ? r2(Math.max(0.28, Math.min(0.75, (shinSlices[0].rx + shinSlices[0].rz) * 0.5)))
+        : 0.38
       capsules.push({
-        id: `thigh_${side}`,
-        boneJp: leg.hipJp,
-        localA: v3r([seg[0] * 0.15, seg[1] * 0.15, seg[2] * 0.15]),
-        localB: v3r([seg[0] * 0.85, seg[1] * 0.85, seg[2] * 0.85]),
-        radiusA: 0.84,
-        radiusB: 0.56,
-        radius: 0.84,
+        id: `shin_${side}`,
+        boneJp: leg.kneeJp,
+        localA: v3r([seg[0] * 0.12, seg[1] * 0.12, seg[2] * 0.12]),
+        localB: v3r([seg[0] * 0.88, seg[1] * 0.88, seg[2] * 0.88]),
+        radiusA: rA,
+        radiusB: rB,
+        radius: Math.max(rA, rB),
+        ...(shinSlices ? { slices: shinSlices } : {}),
       })
     }
   }
@@ -609,12 +753,22 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
     ...(chestR ? [chestR] : []),
   ])
   const physIdxSet = new Set<number>()
+  const rigidByBone = new Map<number, (typeof bones.rigids)[number]>()
   for (const rb of bones.rigids) {
     if ((rb.mode === 1 || rb.mode === 2) && rb.bone >= 0 && rb.bone < bones.bones.length) {
       const jp = bones.bones[rb.bone].jp
       if (!CORE_SKIP.has(jp) && !/胸|乳/.test(jp)) {
         physIdxSet.add(rb.bone)
+        if (!rigidByBone.has(rb.bone)) rigidByBone.set(rb.bone, rb)
       }
+    }
+  }
+  // Map child rigid index -> driving joint (gives real rotMin/rotMax & springRot!)
+  const jointByChildBone = new Map<number, NonNullable<typeof bones.joints>[number]>()
+  for (const jt of bones.joints ?? []) {
+    if (jt.rigidB >= 0 && jt.rigidB < bones.rigids.length) {
+      const bIdx = bones.rigids[jt.rigidB].bone
+      if (bIdx >= 0 && !jointByChildBone.has(bIdx)) jointByChildBone.set(bIdx, jt)
     }
   }
   // Map each physics bone to its children (for accurate restDir & segLen)
@@ -665,6 +819,27 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
     const segLen = Math.max(0.25, Math.min(2.5, vLen(segVec)))
     const restDir = vLen(segVec) > 1e-4 ? vNorm(segVec) : [0, -1, 0] as V3
 
+    const jt = jointByChildBone.get(idx)
+    const rb = rigidByBone.get(idx)
+    let maxConeDeg: number | undefined
+    let stiffness: number | undefined
+    if (jt) {
+      const maxLimRad = Math.max(
+        Math.abs(jt.rotMin[0]), Math.abs(jt.rotMax[0]),
+        Math.abs(jt.rotMin[2]), Math.abs(jt.rotMax[2]),
+      )
+      if (maxLimRad > 0.01) {
+        maxConeDeg = Math.round(Math.max(6, Math.min(42, (maxLimRad * 180) / Math.PI)))
+      }
+      const avgSpring = (jt.springRot[0] + jt.springRot[1] + jt.springRot[2]) / 3
+      if (avgSpring > 0) {
+        stiffness = r2(Math.max(0.12, Math.min(0.60, 0.14 + Math.min(1, avgSpring / 60) * 0.36)))
+      }
+    }
+    const damping = rb?.angularDamp != null
+      ? r2(Math.max(0.65, Math.min(0.92, 0.90 - Math.min(1, rb.angularDamp) * 0.22)))
+      : undefined
+
     physicsNodes.push({
       boneJp: b.jp,
       parentJp: pBone.jp,
@@ -674,6 +849,9 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       restOffsetFromParent: v3r(restOffsetFromParent),
       restDir: v3r(restDir),
       segLen: r2(segLen),
+      ...(maxConeDeg != null ? { maxConeDeg } : {}),
+      ...(stiffness != null ? { stiffness } : {}),
+      ...(damping != null ? { damping } : {}),
     })
   }
   if (physicsNodes.length > 0) {
@@ -682,8 +860,50 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
     notes.push(`Secondary physics chains discovered: ${physicsNodes.length} nodes (${hairC} hair, ${clothC} cloth/ribbons)`)
   }
 
+  // Extract true knee flexion limit from PMX IK links if available
+  let kneeFlexMaxDeg = 142
+  for (const ikJp of ["左足ＩＫ", "右足ＩＫ"]) {
+    const ikIdx = bones.indexByJp.get(ikJp)
+    const links = ikIdx != null ? bones.bones[ikIdx]?.ikLinks : undefined
+    if (links) {
+      for (const lk of links) {
+        if (lk.hasLimit && lk.maxRad && lk.minRad) {
+          const spanDeg = Math.round((Math.max(Math.abs(lk.maxRad[0]), Math.abs(lk.minRad[0])) * 180) / Math.PI)
+          if (spanDeg >= 90 && spanDeg <= 175) {
+            kneeFlexMaxDeg = Math.min(kneeFlexMaxDeg, spanDeg)
+          }
+        }
+      }
+    }
+  }
+
+  // 10. Garment & proportion summary for motion constraints
+  const hipYVal = hipP?.[1] ?? m.hipY ?? 8.0
+  let lowerClothNodes = 0
+  let maxLowerRadius = 0
+  for (const pn of physicsNodes) {
+    if (pn.kind !== "cloth") continue
+    const bPos = getPos(pn.boneJp)
+    if (bPos && bPos[1] <= hipYVal + 0.5) {
+      lowerClothNodes++
+      const dHoriz = Math.hypot(bPos[0], bPos[2])
+      if (dHoriz > maxLowerRadius) maxLowerRadius = dHoriz
+    }
+  }
+  const hasSkirtOrLongCoat = lowerClothNodes >= 8
+  const headToBodyRatio = m.heightUnits > 0 && m.headRadius != null ? r2((m.headRadius * 2) / m.heightUnits) : 0.14
+  const garmentProfile: GarmentProfile = {
+    hasSkirtOrLongCoat,
+    lowerClothNodes,
+    lowerClothClearanceRadius: r2(maxLowerRadius),
+    headToBodyRatio,
+  }
+  if (hasSkirtOrLongCoat) {
+    notes.push(`Lower-body cloth/coat detected (${lowerClothNodes} nodes, clearance r≈${garmentProfile.lowerClothClearanceRadius}u)`)
+  }
+
   return {
-    version: "1.0",
+    version: RIG_PROFILE_VERSION,
     modelId,
     modelName: bones.modelName || modelId,
     measurements: m,
@@ -700,7 +920,7 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       forearmTwistMaxDeg: 85,
       wristSwingMaxDeg: 58,
       shoulderLiftMaxDeg: 20,
-      kneeFlexMaxDeg: 142,
+      kneeFlexMaxDeg,
     },
     softTissue: {
       grooveJp,
@@ -709,6 +929,7 @@ export function buildRigProfile(bones: PmxBones, modelId = "unknown"): RigProfil
       extraMorphs,
       physicsNodes,
     },
+    garmentProfile,
     calibrationNotes: notes,
   }
 }
